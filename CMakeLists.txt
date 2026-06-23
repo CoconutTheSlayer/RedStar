@@ -242,6 +242,8 @@ if(POSEIDON_ENABLE_RUST)
     add_subdirectory(apps/spikes/RustSpike)
     include(${CMAKE_SOURCE_DIR}/cmake/PoseidonArchive.cmake)
     add_subdirectory(apps/spikes/PboReadSpike)
+    # Differential parity test: C++ (PoseidonFormats) vs Rust (PoseidonArchive).
+    add_subdirectory(apps/spikes/PboParitySpike)
 endif()
 
 include(${CMAKE_SOURCE_DIR}/cmake/TridentCTest.cmake)
