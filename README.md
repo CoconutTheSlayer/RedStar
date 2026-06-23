@@ -25,7 +25,80 @@ cmake --preset win-x64-clang-rwdi
 cmake --build build/win-x64-clang-rwdi
 ```
 
-On GNU/Linux, use the matching `linux-x64-clang-rwdi` preset.
+On GNU/Linux, use the matching `linux-x64-clang-rwdi` preset. On macOS (Apple
+Silicon), use `mac-arm64-clang-rwdi` — see [Building and running on macOS](#building-and-running-on-macos-apple-silicon).
+
+## Building and running on macOS (Apple Silicon)
+
+The engine builds and runs natively on Apple Silicon (arm64) Macs against an
+OpenGL 4.1 Core context (macOS's GL ceiling), with SDL3 for windowing and
+OpenAL Soft for audio. The macOS preset, toolchain, and vcpkg triplet live
+under `cmake/` (`mac-arm64-clang`, `mac-arm64-clang.cmake`, `arm64-osx-clang`).
+
+> Intel Macs are untracked: the build is fixed to `arm64`. macOS OpenGL is
+> deprecated by Apple but still functional through its GL-on-Metal layer.
+
+### 1. Prerequisites
+
+```sh
+xcode-select --install                 # Apple Clang + macOS SDK (libc++, ld64)
+brew install cmake ninja ccache pkg-config clang-format
+
+# vcpkg (any location); export VCPKG_ROOT so the presets find it
+git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+export VCPKG_ROOT="$HOME/vcpkg"        # add to your shell profile to persist
+```
+
+`ninja` and `ccache` are required by the shared preset; `pkg-config` and
+`clang-format` are required by vcpkg ports and the CMake `Format` target.
+
+### 2. Build
+
+```sh
+cmake --preset mac-arm64-clang-rwdi          # configures + builds all vcpkg deps from source (first run is slow)
+cmake --build build/mac-arm64-clang-rwdi --target PoseidonGame
+```
+
+The native arm64 binary lands at
+`build/mac-arm64-clang-rwdi/apps/cwr/Game/PoseidonGame`, and the LGPL
+`libopenal.1.dylib` is copied next to it automatically.
+
+### 3. Get the game data (free, via Steam)
+
+The compiled binary needs **Remaster** game data — the `cwr_*` fonts and menu
+world the engine expects ship with *Arma: Cold War Assault Remastered*, not with
+the older *Arma: Cold War Assault* re-release. The free
+[Remaster Demo](https://store.steampowered.com/app/4819000) (app id `4819000`)
+provides compatible data.
+
+The Demo has no macOS depot, so download its (platform-agnostic) data files with
+[SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD), forcing the
+Windows depot — you only need the data, not the bundled Windows executable:
+
+```sh
+brew install --cask steamcmd
+steamcmd +@sSteamCmdForcePlatformType windows \
+         +force_install_dir "$HOME/cwa-remaster" \
+         +login YOUR_STEAM_USERNAME \
+         +app_update 4819000 validate +quit
+```
+
+Enter your Steam password (and Steam Guard code) when prompted. This installs the
+data into `~/cwa-remaster`. The full retail Remaster data works the same way —
+point `-C` (below) at whichever data directory you have.
+
+### 4. Run
+
+```sh
+./run-mac.sh                                  # launches windowed against ~/cwa-remaster
+# or directly:
+build/mac-arm64-clang-rwdi/apps/cwr/Game/PoseidonGame -C ~/cwa-remaster --window
+```
+
+Useful flags: `--fullscreen` (drop `--window`), `--fps` (frame-rate overlay),
+`--help` / `--help-full` for the rest. `-C` / `--work-dir` points the engine at
+the game-data directory (the one containing `DTA/`, `AddOns/`, `Worlds/`, etc.).
 
 ## Layout
 

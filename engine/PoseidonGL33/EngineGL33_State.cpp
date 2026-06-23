@@ -491,11 +491,16 @@ void EngineGL33::Init3DState()
     if (GLAD_GL_ARB_clip_control)
     {
         glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+        Poseidon::gGpuClipZeroToOne = true;
         LOG_DEBUG(Graphics, "GL33: glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE) enabled");
     }
     else
     {
-        LOG_WARN(Graphics, "GL33: GL_ARB_clip_control not available — depth precision will be reduced");
+        // macOS (GL 4.1) has no ARB_clip_control. Fall back to GL-native
+        // [-1, 1] NDC depth; ConvertProjectionMatrix remaps projections so the
+        // resulting window depth (and shadow maps) match the ZERO_TO_ONE path.
+        Poseidon::gGpuClipZeroToOne = false;
+        LOG_WARN(Graphics, "GL33: GL_ARB_clip_control unavailable — using [-1,1] NDC depth remap");
     }
 
     // Apply default state

@@ -460,6 +460,18 @@ int SurfaceInfoGL33::CreateSurface(const TextureDescGL33& desc, PacFormat format
     // makes the format immutable (no driver re-validation per upload), and
     // reports allocation failure once instead of per-mip.  Subsequent
     // pixel uploads use glTex(Compressed)SubImage2D in the loader.
+    //
+    // macOS caps GL at 4.1, so glTexStorage2D is not core there — but the
+    // function is still exported via GL_ARB_texture_storage on every Metal-era
+    // GPU, so glad loads the pointer.  Guard against the (unsupported-hardware)
+    // case where it is null, which would otherwise be a null-pointer call.
+    if (!glTexStorage2D)
+    {
+        Poseidon::Foundation::ErrorMessage(
+            "GL33: glTexStorage2D unavailable (no GL 4.2 / ARB_texture_storage). "
+            "An OpenGL 4.1+ GPU with immutable texture storage is required.");
+        return -1;
+    }
     glTexStorage2D(GL_TEXTURE_2D, desc.nMipmaps, desc.internalFormat, desc.w, desc.h);
     GLenum allocErr = glGetError();
     if (allocErr != GL_NO_ERROR)

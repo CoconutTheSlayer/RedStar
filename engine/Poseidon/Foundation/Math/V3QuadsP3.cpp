@@ -9,9 +9,11 @@
 #include <Poseidon/Foundation/Math/Math3D.hpp>
 #ifdef _MSC_VER
 #include <intrin.h> // For MMX intrinsics
-#else
+#elif defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
 #endif
+// On non-x86 (e.g. arm64) there are no x86 intrinsics; the SSE body below is
+// gated by _COMPILER_CAN_PIII (undefined here) and compiles out entirely.
 
 #if defined __ICL
 #define _COMPILER_CAN_PIII 1

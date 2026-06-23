@@ -2,14 +2,15 @@
 #include <Poseidon/Foundation/Memory/MemGrow.hpp>
 #include <Poseidon/Core/Global.hpp>
 #include <Poseidon/Foundation/Common/Win.h>
-#ifndef _WIN32
-#include <linux/sysinfo.h>
-#endif
 #include <Poseidon/Foundation/Framework/AppFrame.hpp>
 #ifndef _WIN32
 #include <sys/mman.h>
-#include <sys/sysinfo.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#else
+#include <sys/sysinfo.h>
+#endif
 #endif
 
 namespace Poseidon::Foundation
@@ -141,6 +142,21 @@ bool MemGrow::Commit(size_t size)
                          static_cast<unsigned long long>(ConvertToMB(mstat.dwTotalPageFile)),
                          static_cast<unsigned long long>(ConvertToMB(mstat.dwAvailPageFile)),
                          static_cast<unsigned long long>(ConvertToMB(mstat.dwTotalPageFile - mstat.dwAvailPageFile)));
+#elif defined(__APPLE__)
+            // macOS has no <sys/sysinfo.h>; query swap via sysctl(vm.swapusage).
+            struct xsw_usage sw = {};
+            size_t swLen = sizeof(sw);
+            unsigned long long totalSwap = 0, freeSwap = 0;
+            if (sysctlbyname("vm.swapusage", &sw, &swLen, nullptr, 0) == 0)
+            {
+                totalSwap = ConvertToMB((size_t)sw.xsu_total);
+                freeSwap = ConvertToMB((size_t)sw.xsu_avail);
+            }
+            ErrorMessage("Cannot increase memory pool to %llu MB.\\n"
+                         "Current memory pool size is %llu MB.\\n"
+                         "Total swap: %llu MB, Free swap: %llu MB",
+                         static_cast<unsigned long long>(ConvertToMB(size)),
+                         static_cast<unsigned long long>(ConvertToMB(_commited)), totalSwap, freeSwap);
 #else
             struct sysinfo si;
             sysinfo(&si);
