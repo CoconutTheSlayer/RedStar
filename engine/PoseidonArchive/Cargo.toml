@@ -1,0 +1,27 @@
+[package]
+name = "poseidon_archive"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI for reading OFP/Poseidon PBO archives, backed by papa-bear-archive"
+license = "MIT"
+rust-version = "1.79"
+
+[lib]
+name = "poseidon_archive"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The standalone, safe PBO/LZSS implementation (no engine dependency). This crate
+# only wraps it in a C ABI; the parsing logic lives there and is shared with the
+# mserver tooling.
+papa-bear-archive = { path = "../../mserver/Archive" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

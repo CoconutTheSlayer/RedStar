@@ -1,0 +1,23 @@
+[package]
+name = "poseidon_rust"
+version = "0.1.0"
+edition = "2021"
+description = "Toolchain spike: a Rust staticlib called by the C++ engine over a C ABI"
+license = "MIT"
+rust-version = "1.79"
+
+[lib]
+name = "poseidon_rust"
+# staticlib: the archive the C++ build links via Corrosion.
+# rlib:      keeps `cargo test` (the unit tests below) working, since the test
+#            harness needs to depend on the crate as a normal Rust library.
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+# Generates include/poseidon_rust.h from the source at build time (see build.rs)
+# so the C header can never drift from the Rust signatures.
+cbindgen = "0.27"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
