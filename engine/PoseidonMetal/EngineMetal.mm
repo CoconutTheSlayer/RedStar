@@ -64,6 +64,12 @@ struct MetalState
     id<MTLBuffer> worldUBO = nil;         // WorldInstances (256 mat4)
     int depthW = 0, depthH = 0;
 
+    id<MTLTexture> meshTex = nil; // current section texture (set by PrepareTriangleTL)
+
+    // M3 debug instrumentation (per-frame mesh draw stats).
+    int dbgMeshDraws = 0;
+    int dbgMeshIndices = 0;
+
     // Triple-buffered dynamic vertex ring for 2D immediate-mode geometry.
     static constexpr int kRingCount = 3;
     static constexpr size_t kRingBytes = 4 * 1024 * 1024; // ~100k TLVertex
@@ -439,6 +445,10 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     [_m->enc setViewport:vp];
 
     _frameConstantsBuilt = false; // rebuild 3D frame constants lazily this frame
+    // Sun is on at frame start; the shadow pass toggles it off/on mid-frame.
+    // (EnableSunLight(false) must not leak across frames -> unlit world.)
+    _sunEnabled = true;
+    _vsShadow[20 * 4] = 1.0f; // VS_SUNEN
 
     Engine::InitDraw();
     _frameOpen = true;
@@ -473,6 +483,13 @@ void EngineMetal::Present()
     {
         [_m->enc endEncoding];
         _m->enc = nil;
+    }
+
+    if (_m->dbgMeshDraws > 0)
+    {
+        LOG_INFO(Graphics, "Metal: frame mesh draws={} indices={}", _m->dbgMeshDraws, _m->dbgMeshIndices);
+        _m->dbgMeshDraws = 0;
+        _m->dbgMeshIndices = 0;
     }
 
     id<CAMetalDrawable> drawable = [_m->layer nextDrawable];
@@ -859,8 +876,8 @@ void EngineMetal::BuildFrameConstants()
     float sd[4] = {(float)dir.X(), (float)dir.Y(), (float)dir.Z(), 0};
     memcpy(_vsShadow + 12 * 4, sd, 16); // VS_SUNDIR
 
-    float se[4] = {_sunEnabled ? 1.0f : 0.0f, 0, 0, 0};
-    memcpy(_vsShadow + 20 * 4, se, 16); // VS_SUNEN
+    // sunEn is owned by EnableSunLight + the per-frame reset in InitDraw — don't
+    // clobber it here (the shadow pass toggles it off/on mid-frame).
 
     float fStart = cam->ClipNear(), fEnd = cam->ClipFar();
     fStart = GScene->GetFogMinRange();
@@ -908,6 +925,18 @@ void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/
     memcpy(_vsShadow + 33 * 4, lc, 16); // VS_LIGHTCOUNT = 0 (local lights deferred)
 }
 
+void EngineMetal::FogColorChanged(const Color& c)
+{
+    float v[4] = {c.R(), c.G(), c.B(), 1.0f};
+    memcpy(_psShadow + 0 * 4, v, 16); // PS_FOGCOLOR
+}
+
+void EngineMetal::PrepareTriangleTL(const MipInfo& mip, const render::LegacySpec&)
+{
+    auto* tm = static_cast<TextureMetal*>(mip._texture);
+    _m->meshTex = tm ? tm->MetalTexture() : nil;
+}
+
 void EngineMetal::PrepareMeshTL(const LightList& /*lights*/, const Matrix4& modelToWorld, const render::LegacySpec&)
 {
     BuildFrameConstants();
@@ -938,13 +967,22 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
     if (indexCount <= 0)
         return;
 
-    // M3 first pass: lit vertex colour (psFlat), no texture; depth on; no cull.
-    [_m->enc setRenderPipelineState:_m->psoMeshFlat];
+    _m->dbgMeshDraws++;
+    _m->dbgMeshIndices += indexCount;
+
+    id<MTLTexture> tex = _m->meshTex;
+    [_m->enc setRenderPipelineState:(tex ? _m->psoMesh : _m->psoMeshFlat)];
     [_m->enc setDepthStencilState:_m->dss3D];
     [_m->enc setCullMode:MTLCullModeNone];
     [_m->enc setVertexBuffer:buf->vbo offset:0 atIndex:0];
     [_m->enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
     [_m->enc setVertexBuffer:_m->worldUBO offset:0 atIndex:2];
+    if (tex)
+    {
+        [_m->enc setFragmentBytes:_psShadow length:sizeof(_psShadow) atIndex:1];
+        [_m->enc setFragmentTexture:tex atIndex:0];
+        [_m->enc setFragmentSamplerState:_m->samplerLinear atIndex:0];
+    }
     [_m->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:indexCount
                          indexType:MTLIndexTypeUInt16

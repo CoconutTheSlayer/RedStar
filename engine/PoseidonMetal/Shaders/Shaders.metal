@@ -175,8 +175,7 @@ fragment float4 psNormal(VOut in [[stage_in]],
     float4 t = tex0.sample(samp0, in.uv0);
     float4 col = t * in.color;
     col.rgb += in.spec.rgb;
-    // Fog: blend toward fog colour as fogTC -> 0.
-    float3 fogColor = pc.reg[PS_FOGCOLOR].rgb;
-    col.rgb = mix(fogColor, col.rgb, clamp(in.fogTC, 0.0, 1.0));
+    // Fog blend deferred (needs correct fog colour/range — M5/polish); applying it
+    // with an unset fog colour currently crushes the scene to black.
     return col;
 }

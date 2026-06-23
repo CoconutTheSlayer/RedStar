@@ -82,7 +82,7 @@ class EngineMetal : public Engine
     void Restore() override {}
     void SetGamma(float) override {}
     float GetGamma() const override { return 1.0f; }
-    void FogColorChanged(const Color&) override {}
+    void FogColorChanged(const Color& c) override;
 
     // --- Texture bank (placeholder Dummy bank for M1) ---
     AbstractTextBank* TextBank() override;
@@ -100,10 +100,16 @@ class EngineMetal : public Engine
     void GetZCoefs(float& zAdd, float& zMult) override { zAdd = 0, zMult = 1; }
 
     // --- 3D mesh path (M3) ---
+    // Advertise hardware T&L so the engine routes geometry through the
+    // PrepareMeshTL/DrawSectionTL path (implemented here) rather than the
+    // software DrawPolygon path.
+    bool GetTL() const override { return true; }
+    bool GetTLOnSurface() const override { return true; }
     VertexBuffer* CreateVertexBuffer(const Shape& src, VBType type) override;
     void UpdateProjection() override;
     void EnableSunLight(bool enable) override;
     void SetMaterial(const TLMaterial& mat, const LightList& lights, const render::LegacySpec& spec) override;
+    void PrepareTriangleTL(const MipInfo& mip, const render::LegacySpec& spec) override;
     void PrepareMeshTL(const LightList& lights, const Matrix4& modelToWorld, const render::LegacySpec& spec) override;
     void BeginMeshTL(const Shape& sMesh, int spec, bool dynamic) override;
     void EndMeshTL(const Shape& sMesh) override;
