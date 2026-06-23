@@ -235,10 +235,13 @@ add_subdirectory(apps/tools/Studio)
 add_subdirectory(apps/tetris/Tetris)
 add_subdirectory(tests/unit/apps/Tetris)
 
-# Rust FFI toolchain spike (Corrosion-imported staticlib + RustSpike consumer).
+# Rust FFI toolchain spike (Corrosion-imported staticlib + RustSpike consumer),
+# plus the first real Rust module: PoseidonArchive (PBO reading).
 if(POSEIDON_ENABLE_RUST)
     include(${CMAKE_SOURCE_DIR}/cmake/PoseidonRust.cmake)
     add_subdirectory(apps/spikes/RustSpike)
+    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonArchive.cmake)
+    add_subdirectory(apps/spikes/PboReadSpike)
 endif()
 
 include(${CMAKE_SOURCE_DIR}/cmake/TridentCTest.cmake)

@@ -39,8 +39,10 @@ cargo test --manifest-path engine/PoseidonRust/Cargo.toml   # Rust-side unit tes
   build); CI should run a build then `git diff --exit-code` on it to catch drift.
   Do not edit the header by hand.
 
-## Next step
+## Status
 
-Replace this spike with the first real leaf module behind the same boundary —
-the `PoseidonFormats` C API (P3D/PAA/PBO/RTM parsing) is the natural first
-target; `mserver/Archive` already has a Rust PBO/LZSS implementation to draw on.
+The seam is proven and the first real module now lives beside this spike:
+[`PoseidonArchive`](../PoseidonArchive) exposes PBO reading over the same C-ABI
+boundary, backed by the standalone `papa-bear-archive` crate. This `PoseidonRust`
+crate stays as the minimal reference example of the conventions; new modules
+follow its shape (cbindgen header, Corrosion import, `catch_unwind` boundary).
