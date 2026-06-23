@@ -284,7 +284,15 @@ EngineGL33::EngineGL33(int width, int height, bool windowed, int bpp)
     // on in all builds because the day-to-day RelWithDebInfo build is
     // what we develop against, and gating on _DEBUG would leave us without
     // the per-error GL log there.
+    //
+    // macOS has no GL_KHR_debug, and requesting a debug context on its
+    // forward-compatible 4.1 implementation is meaningless (and can make
+    // context creation fail on some drivers), so the debug bit is dropped there.
+#if defined(__APPLE__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG | SDL_GL_CONTEXT_DEBUG_FLAG);
+#endif
 
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);

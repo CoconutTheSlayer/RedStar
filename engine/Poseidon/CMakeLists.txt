@@ -259,7 +259,9 @@ target_include_directories(Poseidon PUBLIC
 target_link_libraries(Poseidon PUBLIC
     spdlog::spdlog
 )
-if(NOT WIN32)
+if(NOT WIN32 AND NOT APPLE)
+    # On macOS pthread and dl are part of libSystem (linked by default); only
+    # Linux needs them named explicitly.
     target_link_libraries(Poseidon PUBLIC pthread dl)
 endif()
 

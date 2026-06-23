@@ -12,6 +12,33 @@
 
 #include <glad/gl.h>
 #include <cstdio>
+#include <cstring>
+
+namespace
+{
+// Append fresh data into a streaming buffer. On Apple's GL-on-Metal driver a
+// plain glBufferSubData into a buffer the GPU drew from earlier this frame forces
+// a full command-buffer submit + CPU/GPU sync. These appends always target a
+// never-yet-drawn region (the ring is orphaned at the start of every fill cycle —
+// see _firstVertex/_firstIndex), so we can map the range UNSYNCHRONIZED and let
+// the driver skip the stall. No-op difference on Windows/Linux, which don't need
+// the hint, so they keep the simpler glBufferSubData path.
+inline void StreamAppend(GLenum target, GLintptr offset, GLsizeiptr size, const void* src)
+{
+#if defined(__APPLE__)
+    void* p = glMapBufferRange(target, offset, size,
+                               GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (p)
+    {
+        std::memcpy(p, src, static_cast<size_t>(size));
+        glUnmapBuffer(target);
+        return;
+    }
+    // Fall through to glBufferSubData if the map failed for any reason.
+#endif
+    glBufferSubData(target, offset, size, src);
+}
+} // namespace
 
 WORD* EngineGL33::QueueAdd(QueueGL33& queue, int n)
 {
@@ -110,7 +137,7 @@ void EngineGL33::FlushQueue(QueueGL33& queue, int index)
         if (n + queue._indexBufferUsed <= IndexBufferLength && !queue._firstIndex)
         {
             indexOffset = queue._indexBufferUsed;
-            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, indexOffset * sizeof(WORD), ibSize, triq._triangleQueue.Data());
+            StreamAppend(GL_ELEMENT_ARRAY_BUFFER, indexOffset * sizeof(WORD), ibSize, triq._triangleQueue.Data());
         }
         else
         {
@@ -444,7 +471,7 @@ void EngineGL33::UploadPendingVertices()
         return;
     const int first = _vboUploadedVerts;
     glBindBuffer(GL_ARRAY_BUFFER, _vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, first * sizeof(TLVertex), (used - first) * sizeof(TLVertex), &_vboMirror[first]);
+    StreamAppend(GL_ARRAY_BUFFER, first * sizeof(TLVertex), (used - first) * sizeof(TLVertex), &_vboMirror[first]);
     _vboUploadedVerts = used;
 }
 

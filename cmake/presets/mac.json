@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "include": [
+    "base.json"
+  ],
+  "configurePresets": [
+    {
+      "name": "mac-clang-debug",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "mac-clang-relwithdebinfo",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "mac-clang-release",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "mac-arm64-clang",
+      "displayName": "macOS arm64 Clang Debug",
+      "inherits": "mac-clang-debug",
+      "binaryDir": "${sourceDir}/build/mac-arm64-clang",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-osx-clang",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/mac-arm64-clang.cmake"
+      }
+    },
+    {
+      "name": "mac-arm64-clang-rwdi",
+      "displayName": "macOS arm64 Clang RelWithDebInfo",
+      "inherits": "mac-clang-relwithdebinfo",
+      "binaryDir": "${sourceDir}/build/mac-arm64-clang-rwdi",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-osx-clang",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/mac-arm64-clang.cmake"
+      }
+    },
+    {
+      "name": "mac-arm64-clang-rel",
+      "displayName": "macOS arm64 Clang Release",
+      "inherits": "mac-clang-release",
+      "binaryDir": "${sourceDir}/build/mac-arm64-clang-rel",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-osx-clang",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/mac-arm64-clang.cmake"
+      }
+    }
+  ]
+}

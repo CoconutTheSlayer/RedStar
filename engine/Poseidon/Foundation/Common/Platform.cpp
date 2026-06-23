@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #include <Poseidon/Foundation/Framework/Log.hpp>
 #include <Poseidon/Foundation/platform.hpp>
 
@@ -223,6 +226,15 @@ bool fileMove(const char* src, const char* dest)
 
 size_t linuxMemoryUsage()
 {
+#if defined(__APPLE__)
+    // No /proc on macOS; query the resident set via the Mach task info API.
+    mach_task_basic_info info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    LOG_DEBUG(Core, "Memory resident: {} KB", (size_t)info.resident_size >> 10);
+    return static_cast<size_t>(info.resident_size);
+#else
     char procfn[32];
     snprintf(procfn, sizeof(procfn), "/proc/%d/statm", getpid());
     FILE* f = fopen(procfn, "rt");
@@ -235,6 +247,7 @@ size_t linuxMemoryUsage()
     LOG_DEBUG(Core, "Memory total: {} KB, shared: {} KB, data: {} KB", (size * pageSize) >> 10,
               (share * pageSize) >> 10, (drs * pageSize) >> 10);
     return (drs * pageSize);
+#endif
 }
 
 // --- POSIX _findfirst/_findnext/_findclose with case-insensitive dir resolution ---

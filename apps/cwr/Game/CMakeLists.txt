@@ -57,6 +57,15 @@ if(WIN32)
         ws2_32.lib
         legacy_stdio_definitions.lib
     )
+elseif(APPLE)
+    # ld64 has no --start-group/--end-group (and doesn't need them: it resolves
+    # circular static-archive references in a single multi-pass link).
+    target_link_libraries(PoseidonGame PRIVATE
+        GameBase
+        PoseidonGL33
+        Poseidon
+        PoseidonOpenAL
+    )
 else()
     target_link_libraries(PoseidonGame PRIVATE
         -Wl,--start-group

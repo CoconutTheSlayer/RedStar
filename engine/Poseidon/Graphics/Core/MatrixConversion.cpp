@@ -6,6 +6,8 @@
 namespace Poseidon
 {
 
+bool gGpuClipZeroToOne = true;
+
 void ConvertMatrix(GfxMatrix& mat, Matrix4Val src)
 {
     mat._11 = src.DirectionAside()[0];
@@ -91,6 +93,18 @@ void ConvertProjectionMatrix(GfxMatrix& mat, Matrix4Val src, float zBias)
             c = src(2, 2) * zMult + zAdd;
             d = src.Position()[2] * zMult;
         }
+    }
+
+    if (!gGpuClipZeroToOne)
+    {
+        // No ARB_clip_control (e.g. macOS GL 4.1): the GPU clips/maps depth in
+        // the native [-1, 1] range, but c and d above encode a [0, 1] clip
+        // depth (NDC z = c + d/z_view).  Remap to NDC z' = 2*(c + d/z) - 1,
+        // i.e. c' = 2c - 1, d' = 2d.  Window depth after the fixed-function
+        // [-1,1]->[0,1] map then equals the original [0,1] value, so depth
+        // buffering and shadow-map reads are unchanged.
+        c = 2.0f * c - 1.0f;
+        d = 2.0f * d;
     }
 
     mat._31 = 0;

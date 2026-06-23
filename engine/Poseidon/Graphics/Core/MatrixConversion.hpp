@@ -27,6 +27,17 @@ struct GfxMatrix
     };
 };
 
+// True when the active GPU's clip-space depth range is [0, 1] — the D3D /
+// Vulkan "zero-to-one" convention, which the GL33 backend normally gets via
+// glClipControl(GL_ZERO_TO_ONE).  False when running on a GL context without
+// ARB_clip_control (notably macOS, whose OpenGL is capped at 4.1): in that
+// case ConvertProjectionMatrix remaps the projection so NDC z lands in GL's
+// native [-1, 1] range.  The remap is depth-equivalent — window-space depth
+// (and therefore shadow-map contents) come out identical — so the rest of the
+// pipeline is unaffected.  Set once by the backend at init; defaults to true,
+// which keeps Windows/Linux behaviour byte-for-byte unchanged.
+extern bool gGpuClipZeroToOne;
+
 // Row-major; maps the OFP coordinate system into the graphics matrix.
 void ConvertMatrix(GfxMatrix& mat, Matrix4Val src);
 void ConvertMatrixTransposed(GfxMatrix& mat, Matrix4Val src);

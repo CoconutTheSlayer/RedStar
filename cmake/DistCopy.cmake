@@ -50,6 +50,29 @@ function(dist_copy TARGET)
         unset(_openal_dll)
     endif()
 
+    # macOS: OpenAL is a .dylib (LGPL dynamic linkage). The engine dlopen()s it
+    # via @loader_path, so it must sit next to the executable — both in the dist
+    # dir and beside the freshly-built binary in the build tree. The runtime
+    # SONAME is libopenal.1.dylib (the symlink target vcpkg installs).
+    if(APPLE)
+        get_target_property(_type ${TARGET} TYPE)
+        if(_type STREQUAL "EXECUTABLE")
+            set(_openal_dylib
+                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/libopenal.1.dylib")
+            if(EXISTS "${_openal_dylib}")
+                add_custom_command(TARGET ${TARGET} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_openal_dylib}" "$<TARGET_FILE_DIR:${TARGET}>"
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_openal_dylib}" "${DIST_DIR}"
+                    COMMENT "Copying libopenal.1.dylib next to ${TARGET}"
+                    VERBATIM
+                )
+            endif()
+            unset(_openal_dylib)
+        endif()
+    endif()
+
     # Copy extra files from the target's source directory
     foreach(_extra ${ARG_EXTRA})
         get_filename_component(_name "${_extra}" NAME)

@@ -6,7 +6,13 @@ namespace Poseidon::Foundation
 
 #ifndef _WIN32
 
+#if defined(__APPLE__)
+// Apple's libc spells the recursive-mutex static initializer without the _NP
+// suffix that glibc uses.
+pthread_mutex_t mutexInit = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+#else
 pthread_mutex_t mutexInit = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+#endif
 
 #endif
 

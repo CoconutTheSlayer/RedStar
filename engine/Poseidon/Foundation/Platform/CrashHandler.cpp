@@ -115,7 +115,12 @@ void InstallCrashHandler(const char*)
 #include <fcntl.h>
 #include <execinfo.h>
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#else
 #include <link.h>
+#endif
 
 namespace Poseidon::Foundation
 {
@@ -245,8 +250,23 @@ void handler(int sig, siginfo_t* info, void* /*ucontext*/)
     // Module load bases — only to the file; keeps the terminal output short.
     if (fd >= 0)
     {
+#if defined(__APPLE__)
+        // No /proc on macOS; dump the dyld image table (name @ Mach-O header addr),
+        // which gives the per-image load base for offline symbolication.
+        emit(fd, -1, "\ndyld images (name @ load-base):\n");
+        uint32_t imgCount = _dyld_image_count();
+        for (uint32_t i = 0; i < imgCount; i++)
+        {
+            const char* nm = _dyld_get_image_name(i);
+            emit(fd, -1, nm ? nm : "?");
+            emit(fd, -1, " @ ");
+            emitHex(fd, -1, (unsigned long)_dyld_get_image_header(i));
+            emit(fd, -1, "\n");
+        }
+#else
         emit(fd, -1, "\n/proc/self/maps:\n");
         copyFileTo(fd, "/proc/self/maps");
+#endif
         close(fd);
     }
 
@@ -258,6 +278,37 @@ void handler(int sig, siginfo_t* info, void* /*ucontext*/)
     raise(sig);
 }
 
+#if defined(__APPLE__)
+void captureBuildId()
+{
+    // Mach-O: read the main executable's LC_UUID load command (the build-id analog).
+    g_buildId[0] = '\0';
+    const struct mach_header* mh = _dyld_get_image_header(0);
+    if (!mh)
+        return;
+    const bool is64 = mh->magic == MH_MAGIC_64 || mh->magic == MH_CIGAM_64;
+    const uint8_t* p =
+        reinterpret_cast<const uint8_t*>(mh) + (is64 ? sizeof(struct mach_header_64) : sizeof(struct mach_header));
+    for (uint32_t i = 0; i < mh->ncmds; i++)
+    {
+        const auto* lc = reinterpret_cast<const struct load_command*>(p);
+        if (lc->cmd == LC_UUID)
+        {
+            const auto* uc = reinterpret_cast<const struct uuid_command*>(lc);
+            char* w = g_buildId;
+            static const char hex[] = "0123456789abcdef";
+            for (int b = 0; b < 16 && (w - g_buildId) < (long)sizeof(g_buildId) - 2; b++)
+            {
+                *w++ = hex[uc->uuid[b] >> 4];
+                *w++ = hex[uc->uuid[b] & 0xF];
+            }
+            *w = '\0';
+            return;
+        }
+        p += lc->cmdsize;
+    }
+}
+#else
 void captureBuildId()
 {
     g_buildId[0] = '\0';
@@ -297,6 +348,7 @@ void captureBuildId()
         },
         nullptr);
 }
+#endif // __APPLE__
 } // namespace
 
 void InstallCrashHandler(const char* crashDir)

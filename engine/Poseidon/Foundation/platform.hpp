@@ -83,7 +83,9 @@ typedef size_t SIZE_T;
 #define __cdecl
 #define WINAPI
 
-#define _finite(x) finite(x)
+// Use the C99 standard classifiers: glibc still ships the legacy BSD finite(),
+// but macOS/libc++ removed it in favour of isfinite().
+#define _finite(x) isfinite(x)
 #define _isnan(x) isnan(x)
 extern char* strDup(const char* src);
 

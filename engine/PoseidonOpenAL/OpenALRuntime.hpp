@@ -142,6 +142,23 @@ inline bool TryLoadModule()
         SetError("OpenAL32.dll is not available");
         return false;
     }
+#elif defined(__APPLE__)
+    // macOS dylibs use the .dylib suffix.  Prefer the copy shipped next to the
+    // executable (@loader_path), then fall back to the standard dyld search
+    // paths (DYLD_LIBRARY_PATH / system frameworks).
+    const char* candidates[] = {"@loader_path/libopenal.1.dylib", "@loader_path/libopenal.dylib",
+                                "libopenal.1.dylib", "libopenal.dylib"};
+    for (const char* cand : candidates)
+    {
+        ModuleHandle() = dlopen(cand, RTLD_NOW | RTLD_LOCAL);
+        if (ModuleHandle() != nullptr)
+            break;
+    }
+    if (ModuleHandle() == nullptr)
+    {
+        SetError("libopenal.dylib is not available");
+        return false;
+    }
 #else
     ModuleHandle() = dlopen("libopenal.so.1", RTLD_NOW | RTLD_LOCAL);
     if (ModuleHandle() == nullptr)

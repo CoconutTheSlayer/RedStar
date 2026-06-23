@@ -16,6 +16,21 @@
 #include <map>
 #include <vector>
 
+// Apple's deprecated OpenGL is implemented on top of Metal, and its driver does
+// a full CPU/GPU sync (flushContext -> submitCommandBuffer) whenever
+// glBufferSubData targets a buffer the *previous* draw read from. The per-draw
+// UBO updates below hit that path once per object, which collapses the menu to
+// ~16 fps on an M5. Orphaning the buffer first (respecify same-size storage with
+// a null pointer) makes the driver hand back fresh storage instead of stalling
+// on in-flight GPU work. No-op on Windows/Linux, whose native GL drivers already
+// rename buffers internally and don't need the hint. The caller must hold the
+// target UBO bound to GL_UNIFORM_BUFFER.
+#if defined(__APPLE__)
+#define APPLE_ORPHAN_UBO(bytes) glBufferData(GL_UNIFORM_BUFFER, (bytes), nullptr, GL_DYNAMIC_DRAW)
+#else
+#define APPLE_ORPHAN_UBO(bytes) ((void)0)
+#endif
+
 // Screen-space vertex shader (pre-transformed TLVertex).
 // Attribute layout matches VAO: pos(vec3)@0, rhw(float)@1, color@2, specular@3, uv0@4, uv1@5
 static const char s_vsScreenGLSL[] = R"(#version 330 core
@@ -785,6 +800,7 @@ void EngineGL33::FlushVSConstants()
     // glBindBufferBase is sticky — done once at UBO creation in
     // InitVertexShaders.  Per-flush we only update buffer contents.
     glBindBuffer(GL_UNIFORM_BUFFER, s_vsUBO);
+    APPLE_ORPHAN_UBO(sizeof(s_vsShadow));
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(s_vsShadow), s_vsShadow);
 }
 
@@ -804,6 +820,7 @@ void EngineGL33::FlushPSConstants()
     if (s_psEverUploaded && s_psUploadedUBO == s_psUBO && memcmp(s_psUploaded, s_psShadow, sizeof(s_psShadow)) == 0)
         return;
     glBindBuffer(GL_UNIFORM_BUFFER, s_psUBO);
+    APPLE_ORPHAN_UBO(sizeof(s_psShadow));
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(s_psShadow), s_psShadow);
     memcpy(s_psUploaded, s_psShadow, sizeof(s_psShadow));
     s_psEverUploaded = true;
@@ -1089,6 +1106,7 @@ void EngineGL33::UploadWorldInstances(const float* matrices, int count)
     if (count > 256)
         count = 256;
     glBindBuffer(GL_UNIFORM_BUFFER, s_worldUBO);
+    APPLE_ORPHAN_UBO(256 * 64);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, count * 64, matrices);
 }
 
@@ -1100,6 +1118,7 @@ void EngineGL33::UploadVSWorldMatrix(const float worldMatrix[16])
     if (s_worldUBO)
     {
         glBindBuffer(GL_UNIFORM_BUFFER, s_worldUBO);
+        APPLE_ORPHAN_UBO(256 * 64);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, 64, worldMatrix);
         return;
     }
