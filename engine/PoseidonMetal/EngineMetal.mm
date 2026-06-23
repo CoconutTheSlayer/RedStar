@@ -1486,6 +1486,28 @@ void EngineMetal::BeginMeshTL(const Shape& sMesh, int /*spec*/, bool dynamic)
 }
 void EngineMetal::EndMeshTL(const Shape& /*sMesh*/) {}
 
+// Detail draws sample tex1 at uv0*32 (mirrors GL33 TGDetail: texCtrl.y=1,
+// texMat1 = diag(32,32,32,1)).  Written every draw so non-detail draws reset it.
+void EngineMetal::ApplyDetailTexgen(bool detail)
+{
+    float* texCtrl = _vsShadow + VSlot::TexCtrl * 4;
+    if (detail)
+    {
+        texCtrl[0] = 0.0f;
+        texCtrl[1] = 1.0f;
+        texCtrl[2] = 0.0f;
+        texCtrl[3] = 0.0f;
+        float* texMat1 = _vsShadow + VSlot::TexMat1 * 4;
+        memset(texMat1, 0, 16 * sizeof(float));
+        texMat1[0] = texMat1[5] = texMat1[10] = 32.0f;
+        texMat1[15] = 1.0f;
+    }
+    else
+    {
+        texCtrl[0] = texCtrl[1] = texCtrl[2] = texCtrl[3] = 0.0f;
+    }
+}
+
 void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
 {
     if (!_m || !_m->enc)
@@ -1519,25 +1541,7 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
                                    ? _bank->DetailMetalTexture()
                                    : nil;
     const bool detail = detailTex != nil;
-
-    // Texgen: detail draws sample tex1 at uv0*32 (mirrors GL33 TGDetail: texCtrl.y=1,
-    // texMat1 = diag(32,32,32,1)).  Written every draw so non-detail draws reset it.
-    float* texCtrl = _vsShadow + VSlot::TexCtrl * 4;
-    if (detail)
-    {
-        texCtrl[0] = 0.0f;
-        texCtrl[1] = 1.0f;
-        texCtrl[2] = 0.0f;
-        texCtrl[3] = 0.0f;
-        float* texMat1 = _vsShadow + VSlot::TexMat1 * 4;
-        memset(texMat1, 0, 16 * sizeof(float));
-        texMat1[0] = texMat1[5] = texMat1[10] = 32.0f;
-        texMat1[15] = 1.0f;
-    }
-    else
-    {
-        texCtrl[0] = texCtrl[1] = texCtrl[2] = texCtrl[3] = 0.0f;
-    }
+    ApplyDetailTexgen(detail);
 
     const bool isShadow = passDesc.shader == render::ShaderFamily::Shadow;
     const bool useBlend = passDesc.blend != render::BlendMode::Opaque || passDesc.alpha == render::AlphaMode::Blend ||
