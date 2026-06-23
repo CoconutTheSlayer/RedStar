@@ -32,6 +32,13 @@ class EngineMetal : public Engine
     bool _frameOpen = false;
     RString _pendingScreenshotPath;
 
+    // CPU shadows of the VS/PS uniform blocks (mirror EngineGL33's s_vsShadow /
+    // s_psShadow). 70 vec4 (VSConstants) + 27 vec4 (PSConstants).
+    float _vsShadow[70 * 4] = {};
+    float _psShadow[27 * 4] = {};
+    bool _sunEnabled = true;
+    bool _frameConstantsBuilt = false;
+
   public:
     EngineMetal(int width, int height, bool windowed, int bpp);
     ~EngineMetal() override;
@@ -92,7 +99,17 @@ class EngineMetal : public Engine
     void SetBias(int) override {}
     void GetZCoefs(float& zAdd, float& zMult) override { zAdd = 0, zMult = 1; }
 
-    // --- Geometry / 2D submission: no-op stubs until M2/M3 ---
+    // --- 3D mesh path (M3) ---
+    VertexBuffer* CreateVertexBuffer(const Shape& src, VBType type) override;
+    void UpdateProjection() override;
+    void EnableSunLight(bool enable) override;
+    void SetMaterial(const TLMaterial& mat, const LightList& lights, const render::LegacySpec& spec) override;
+    void PrepareMeshTL(const LightList& lights, const Matrix4& modelToWorld, const render::LegacySpec& spec) override;
+    void BeginMeshTL(const Shape& sMesh, int spec, bool dynamic) override;
+    void EndMeshTL(const Shape& sMesh) override;
+    void DrawSectionTL(const Shape& sMesh, int beg, int end) override;
+
+    // --- Geometry / 2D submission: no-op stubs ---
     void PrepareMesh(const render::LegacySpec&) override {}
     void BeginMesh(TLVertexTable&, const render::LegacySpec&) override {}
     void EndMesh(TLVertexTable&) override {}
@@ -113,6 +130,7 @@ class EngineMetal : public Engine
     void DestroyMetal();
     void Present();
     void CaptureScreenshotIfPending();
+    void BuildFrameConstants();
 };
 
 } // namespace Poseidon

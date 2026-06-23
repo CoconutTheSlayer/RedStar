@@ -4,7 +4,13 @@
 #include <PoseidonMetal/TextureMetal.hpp>
 #include <Poseidon/Graphics/Shared/ScreenshotWriter.hpp>
 #include <Poseidon/Graphics/Core/TLVertex.hpp>
+#include <Poseidon/Graphics/Core/MatrixConversion.hpp>
+#include <Poseidon/Graphics/Rendering/Primitives/Vertex.hpp>
+#include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
+#include <Poseidon/World/Scene/Scene.hpp>
+#include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/Core/Application.hpp>
+#include <Poseidon/Core/Global.hpp>
 #include <Poseidon/Foundation/Framework/AppFrame.hpp>
 #include <Poseidon/Foundation/Framework/Log.hpp>
 
@@ -45,9 +51,18 @@ struct MetalState
 
     // Shaders / pipeline (M2 spine)
     id<MTLLibrary> lib = nil;
-    id<MTLRenderPipelineState> psoFlat = nil;   // vsScreen + psFlat
-    id<MTLRenderPipelineState> psoNormal = nil; // vsScreen + psNormal
+    id<MTLRenderPipelineState> psoFlat = nil;   // vsScreen + psFlat (2D)
+    id<MTLRenderPipelineState> psoNormal = nil; // vsScreen + psNormal (2D)
     id<MTLSamplerState> samplerLinear = nil;
+
+    // 3D mesh (M3)
+    id<MTLRenderPipelineState> psoMesh = nil;     // vsTransform + psNormal
+    id<MTLRenderPipelineState> psoMeshFlat = nil; // vsTransform + psFlat
+    id<MTLTexture> depthTex = nil;
+    id<MTLDepthStencilState> dss3D = nil; // LEQUAL + write (DepthMode::Normal)
+    id<MTLDepthStencilState> dss2D = nil; // always pass, no write
+    id<MTLBuffer> worldUBO = nil;         // WorldInstances (256 mat4)
+    int depthW = 0, depthH = 0;
 
     // Triple-buffered dynamic vertex ring for 2D immediate-mode geometry.
     static constexpr int kRingCount = 3;
@@ -87,8 +102,26 @@ static MTLVertexDescriptor* MakeTLVertexDescriptor()
     return vd;
 }
 
+static MTLVertexDescriptor* MakeSVertexDescriptor()
+{
+    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+    vd.attributes[0].format = MTLVertexFormatFloat3; // pos
+    vd.attributes[0].offset = 0;
+    vd.attributes[0].bufferIndex = 0;
+    vd.attributes[1].format = MTLVertexFormatFloat3; // normal
+    vd.attributes[1].offset = sizeof(Vector3P);
+    vd.attributes[1].bufferIndex = 0;
+    vd.attributes[2].format = MTLVertexFormatFloat2; // uv
+    vd.attributes[2].offset = sizeof(Vector3P) * 2;
+    vd.attributes[2].bufferIndex = 0;
+    vd.layouts[0].stride = sizeof(Vector3P) * 2 + sizeof(Poseidon::UVPair);
+    vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    return vd;
+}
+
 static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib, const char* vsName,
-                                          const char* psName, MTLPixelFormat colorFmt, bool blend)
+                                          const char* psName, MTLPixelFormat colorFmt, bool blend,
+                                          MTLVertexDescriptor* vdesc)
 {
     id<MTLFunction> vs = [lib newFunctionWithName:[NSString stringWithUTF8String:vsName]];
     id<MTLFunction> ps = [lib newFunctionWithName:[NSString stringWithUTF8String:psName]];
@@ -100,7 +133,8 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
     MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.vertexFunction = vs;
     pd.fragmentFunction = ps;
-    pd.vertexDescriptor = MakeTLVertexDescriptor();
+    pd.vertexDescriptor = vdesc;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float; // render pass carries depth
     pd.colorAttachments[0].pixelFormat = colorFmt;
     if (blend)
     {
@@ -141,8 +175,12 @@ static bool LoadShaders(MetalState* m)
         return false;
     }
 
-    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, true);
-    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, true);
+    MTLVertexDescriptor* tlDesc = MakeTLVertexDescriptor();
+    MTLVertexDescriptor* svDesc = MakeSVertexDescriptor();
+    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, true, tlDesc);
+    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, true, MakeTLVertexDescriptor());
+    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, false, svDesc);
+    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
 
     MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
     sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -152,8 +190,20 @@ static bool LoadShaders(MetalState* m)
     sd.tAddressMode = MTLSamplerAddressModeRepeat;
     m->samplerLinear = [m->device newSamplerStateWithDescriptor:sd];
 
-    LOG_INFO(Graphics, "Metal: shaders loaded (psoFlat={}, psoNormal={})", m->psoFlat != nil, m->psoNormal != nil);
-    return m->psoFlat != nil;
+    // Depth-stencil states: 3D = LEQUAL + write; 2D = always pass, no write.
+    MTLDepthStencilDescriptor* d3 = [[MTLDepthStencilDescriptor alloc] init];
+    d3.depthCompareFunction = MTLCompareFunctionLessEqual;
+    d3.depthWriteEnabled = YES;
+    m->dss3D = [m->device newDepthStencilStateWithDescriptor:d3];
+    MTLDepthStencilDescriptor* d2 = [[MTLDepthStencilDescriptor alloc] init];
+    d2.depthCompareFunction = MTLCompareFunctionAlways;
+    d2.depthWriteEnabled = NO;
+    m->dss2D = [m->device newDepthStencilStateWithDescriptor:d2];
+
+    m->worldUBO = [m->device newBufferWithLength:256 * 64 options:MTLResourceStorageModeShared];
+
+    LOG_INFO(Graphics, "Metal: shaders loaded (2D={}, mesh={})", m->psoFlat != nil, m->psoMesh != nil);
+    return m->psoFlat != nil && m->psoMesh != nil;
 }
 
 // Fan-triangulate n screen-space TLVertices into the current ring buffer and
@@ -186,6 +236,7 @@ static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MT
     vsConst[21 * 4 + 1] = 2.0f / h;
 
     [m->enc setRenderPipelineState:pso];
+    [m->enc setDepthStencilState:m->dss2D]; // 2D: no depth test/write
     [m->enc setVertexBuffer:m->curRing offset:m->ringUsed atIndex:0];
     [m->enc setVertexBytes:vsConst length:sizeof(vsConst) atIndex:1];
     if (tex)
@@ -204,6 +255,9 @@ EngineMetal::EngineMetal(int width, int height, bool windowed, int bpp)
     _h = height;
     _pixelSize = bpp > 0 ? bpp : 32;
     _windowed = windowed;
+    // Metal NDC depth is natively [0,1], so projection matrices stay zero-to-one
+    // (no clip-control remap — unlike the macOS GL path). See MatrixConversion.
+    Poseidon::gGpuClipZeroToOne = true;
     _m = new MetalState();
 
     if (!CreateWindowAndDevice(width, height, windowed))
@@ -345,6 +399,18 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
         _m->layer.drawableSize = CGSizeMake(pw, ph);
     }
     EnsureFrameTex(_m, _w, _h);
+    if (!_m->depthTex || _m->depthW != _w || _m->depthH != _h)
+    {
+        MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                     width:_w
+                                                                                    height:_h
+                                                                                 mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget;
+        dd.storageMode = MTLStorageModePrivate;
+        _m->depthTex = [_m->device newTextureWithDescriptor:dd];
+        _m->depthW = _w;
+        _m->depthH = _h;
+    }
 
     const float r = ((color >> 16) & 0xFF) / 255.0f;
     const float g = ((color >> 8) & 0xFF) / 255.0f;
@@ -362,11 +428,17 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     rp.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
+    rp.depthAttachment.texture = _m->depthTex;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rp.depthAttachment.clearDepth = 1.0; // Metal NDC depth [0,1], far = 1
 
-    // Persistent per-frame render encoder; 2D draw calls record into it until Present.
+    // Persistent per-frame render encoder; draw calls record into it until Present.
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
     MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
     [_m->enc setViewport:vp];
+
+    _frameConstantsBuilt = false; // rebuild 3D frame constants lazily this frame
 
     Engine::InitDraw();
     _frameOpen = true;
@@ -666,6 +738,218 @@ void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1
     SetV(q[2], x1 - nx, y1 - ny, 0.5f, 1, c1);
     SetV(q[3], x0 - nx, y0 - ny, 0.5f, 1, c0);
     EmitPolyFan(_m, q, 4, _m->psoFlat, nil, _w, _h);
+}
+
+// ---- 3D mesh path (M3) -----------------------------------------------------
+
+namespace
+{
+struct MetalSVertex
+{
+    Vector3P pos;
+    Vector3P norm;
+    Poseidon::UVPair t0;
+};
+struct MeshSection
+{
+    int beg, end;
+};
+} // namespace
+
+class VertexBufferMetal : public VertexBuffer
+{
+  public:
+    id<MTLBuffer> vbo = nil;
+    id<MTLBuffer> ibo = nil;
+    int indexCount = 0;
+    std::vector<MeshSection> sections;
+
+    bool Init(id<MTLDevice> dev, const Shape& src)
+    {
+        const int nv = src.NVertex();
+        if (nv <= 0)
+            return false;
+
+        std::vector<MetalSVertex> verts((size_t)nv);
+        for (int i = 0; i < nv; i++)
+        {
+            const Vector3& p = src.Pos(i);
+            const Vector3& n = src.Norm(i);
+            verts[i].pos = Vector3P(p.X(), p.Y(), p.Z());
+            verts[i].norm = Vector3P(-n.X(), -n.Y(), -n.Z()); // negated, matches GL/D3D11
+            verts[i].t0 = src.UV(i);
+        }
+        vbo = [dev newBufferWithBytes:verts.data()
+                               length:verts.size() * sizeof(MetalSVertex)
+                              options:MTLResourceStorageModeShared];
+
+        // Fan-triangulate faces into 16-bit indices.
+        std::vector<uint16_t> idx;
+        for (Offset o = src.BeginFaces(); o < src.EndFaces(); src.NextFace(o))
+        {
+            const Poly& poly = src.Face(o);
+            for (int i = 2; i < poly.N(); i++)
+            {
+                idx.push_back((uint16_t)poly.GetVertex(0));
+                idx.push_back((uint16_t)poly.GetVertex(i - 1));
+                idx.push_back((uint16_t)poly.GetVertex(i));
+            }
+        }
+        indexCount = (int)idx.size();
+        if (indexCount > 0)
+            ibo = [dev newBufferWithBytes:idx.data()
+                                   length:idx.size() * sizeof(uint16_t)
+                                  options:MTLResourceStorageModeShared];
+
+        // Per-section index ranges.
+        const int ns = src.NSections();
+        sections.resize(ns);
+        int start = 0;
+        for (int i = 0; i < ns; i++)
+        {
+            const ShapeSection& sec = src.GetSection(i);
+            int size = 0;
+            for (Offset o = sec.beg; o < sec.end; src.NextFace(o))
+            {
+                const Poly& face = src.Face(o);
+                size += (face.N() - 2) * 3;
+            }
+            sections[i].beg = start;
+            sections[i].end = start + size;
+            start += size;
+        }
+        return true;
+    }
+
+    void Update(const Shape& /*src*/, bool /*dynamic*/) override {} // static meshes for now
+};
+
+VertexBuffer* EngineMetal::CreateVertexBuffer(const Shape& src, VBType /*type*/)
+{
+    auto* buf = new VertexBufferMetal();
+    if (buf->Init(_m->device, src))
+        return buf;
+    delete buf;
+    return nullptr;
+}
+
+void EngineMetal::BuildFrameConstants()
+{
+    if (_frameConstantsBuilt || !GScene)
+        return;
+    Camera* cam = GScene->GetCamera();
+    if (!cam)
+        return;
+    LightSun* sun = GScene->MainLight();
+
+    GfxMatrix view;
+    ConvertMatrix(view, cam->InverseScaled());
+    view._41 = view._42 = view._43 = 0; // camera-relative
+    memcpy(_vsShadow + 4 * 4, &view, 64); // VS_VIEW
+
+    GfxMatrix proj;
+    ConvertProjectionMatrix(proj, cam->ProjectionNormal(), 0);
+    memcpy(_vsShadow + 0 * 4, &proj, 64); // VS_PROJ
+
+    Vector3 pos = cam->Position();
+    float cp[4] = {(float)pos.X(), (float)pos.Y(), (float)pos.Z(), 0};
+    memcpy(_vsShadow + 17 * 4, cp, 16); // VS_CAMPOS
+
+    Vector3 dir = sun ? sun->Direction() : Vector3(0, -1, 0);
+    float sd[4] = {(float)dir.X(), (float)dir.Y(), (float)dir.Z(), 0};
+    memcpy(_vsShadow + 12 * 4, sd, 16); // VS_SUNDIR
+
+    float se[4] = {_sunEnabled ? 1.0f : 0.0f, 0, 0, 0};
+    memcpy(_vsShadow + 20 * 4, se, 16); // VS_SUNEN
+
+    float fStart = cam->ClipNear(), fEnd = cam->ClipFar();
+    fStart = GScene->GetFogMinRange();
+    fEnd = GScene->GetFogMaxRange();
+    float inv = (fEnd > fStart) ? 1.0f / (fEnd - fStart) : 0.0f;
+    float fp[4] = {fStart, inv, 1.0f, 0};
+    memcpy(_vsShadow + 16 * 4, fp, 16); // VS_FOG
+
+    float tc[4] = {0, 0, 0, 0};
+    memcpy(_vsShadow + 32 * 4, tc, 16); // VS_TEXCTRL (no texgen)
+
+    _frameConstantsBuilt = true;
+}
+
+void EngineMetal::UpdateProjection()
+{
+    if (!GScene || !GScene->GetCamera())
+        return;
+    GfxMatrix proj;
+    ConvertProjectionMatrix(proj, GScene->GetCamera()->ProjectionNormal(), 0);
+    memcpy(_vsShadow + 0, &proj, 64);
+}
+
+void EngineMetal::EnableSunLight(bool enable)
+{
+    _sunEnabled = enable;
+    float se[4] = {enable ? 1.0f : 0.0f, 0, 0, 0};
+    memcpy(_vsShadow + 20 * 4, se, 16);
+}
+
+void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/, const render::LegacySpec& /*spec*/)
+{
+    auto wr = [&](int slot, const Color& c) {
+        float v[4] = {c.R(), c.G(), c.B(), c.A()};
+        memcpy(_vsShadow + slot * 4, v, 16);
+    };
+    wr(13, mat.ambient);   // VS_AMBIENT
+    wr(14, mat.diffuse);   // VS_DIFFUSE
+    wr(15, mat.emmisive);  // VS_EMISSIVE
+    float spec[4] = {mat.specular.R(), mat.specular.G(), mat.specular.B(), (float)mat.specularPower};
+    memcpy(_vsShadow + 18 * 4, spec, 16); // VS_SPEC
+    float specEn[4] = {mat.specularPower > 0 ? 1.0f : 0.0f, 0, 0, 0};
+    memcpy(_vsShadow + 19 * 4, specEn, 16); // VS_SPECEN
+    float lc[4] = {0, 0, 0, 0};
+    memcpy(_vsShadow + 33 * 4, lc, 16); // VS_LIGHTCOUNT = 0 (local lights deferred)
+}
+
+void EngineMetal::PrepareMeshTL(const LightList& /*lights*/, const Matrix4& modelToWorld, const render::LegacySpec&)
+{
+    BuildFrameConstants();
+    GfxMatrix world;
+    ConvertMatrix(world, modelToWorld);
+    world._41 -= _vsShadow[17 * 4 + 0]; // camera-relative (subtract camPos)
+    world._42 -= _vsShadow[17 * 4 + 1];
+    world._43 -= _vsShadow[17 * 4 + 2];
+    if (_m->worldUBO)
+        memcpy([_m->worldUBO contents], &world, 64); // WorldInstances slot 0
+}
+
+void EngineMetal::BeginMeshTL(const Shape& /*sMesh*/, int /*spec*/, bool /*dynamic*/) {}
+void EngineMetal::EndMeshTL(const Shape& /*sMesh*/) {}
+
+void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
+{
+    if (!_m || !_m->enc)
+        return;
+    auto* buf = static_cast<VertexBufferMetal*>(sMesh.GetVertexBuffer());
+    if (!buf || buf->sections.empty() || !buf->vbo || !buf->ibo)
+        return;
+    if (end <= beg || end > (int)buf->sections.size())
+        return;
+
+    const int firstIndex = buf->sections[beg].beg;
+    const int indexCount = buf->sections[end - 1].end - firstIndex;
+    if (indexCount <= 0)
+        return;
+
+    // M3 first pass: lit vertex colour (psFlat), no texture; depth on; no cull.
+    [_m->enc setRenderPipelineState:_m->psoMeshFlat];
+    [_m->enc setDepthStencilState:_m->dss3D];
+    [_m->enc setCullMode:MTLCullModeNone];
+    [_m->enc setVertexBuffer:buf->vbo offset:0 atIndex:0];
+    [_m->enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
+    [_m->enc setVertexBuffer:_m->worldUBO offset:0 atIndex:2];
+    [_m->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:indexCount
+                         indexType:MTLIndexTypeUInt16
+                       indexBuffer:buf->ibo
+                 indexBufferOffset:(NSUInteger)firstIndex * sizeof(uint16_t)];
 }
 
 Engine* CreateEngineMetal(int w, int h, bool windowed, int bpp)
