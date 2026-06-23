@@ -73,6 +73,13 @@ struct VOut
     float3 worldNormal; // camera-relative world normal, for per-pixel lighting
 };
 
+// Normalized surface->camera direction, falling back when the surface sits at
+// the camera origin (first-person geometry) so normalize(0) can't produce NaN.
+static float3 viewSafe(float3 toView)
+{
+    return (dot(toView, toView) > 1e-8) ? normalize(toView) : float3(0.0, 0.0, 1.0);
+}
+
 // Sun + local point/spot lights + sun specular, evaluated at a world position /
 // normal.  Shared by vsTransform (per-vertex, for the untextured psFlat path) and
 // psNormalLit/psDetailLit (per-pixel).  Mirrors the GL33 vertex-lighting math.
@@ -131,10 +138,17 @@ static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, 
     float4 specC = vc.reg[VS_SPEC];
     if (vc.reg[VS_SPECEN].x > 0.5 && sunEn > 0.0)
     {
-        float3 viewDir = normalize(vc.reg[VS_CAMPOS].xyz - worldPos);
-        float3 halfVec = normalize(-sunDir.xyz + viewDir);
-        float NdotH = max(0.0, dot(N, halfVec));
-        spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
+        // Two normalize() guards (NaN -> 0 = black surface):
+        //  - toView ~ 0: first-person geometry sits at the camera origin.
+        //  - half-vector ~ 0: viewDir == sunDir when looking straight at a
+        //    backlit surface ("toward the light") — this was the black gun.
+        float3 toView = vc.reg[VS_CAMPOS].xyz - worldPos;
+        float3 hv = viewSafe(toView) - sunDir.xyz; // half-vector numerator
+        if (dot(hv, hv) > 1e-8)
+        {
+            float NdotH = max(0.0, dot(N, normalize(hv)));
+            spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
+        }
     }
     outSpec = clamp(spec, 0.0, 1.0);
     return litColor;
@@ -317,7 +331,8 @@ fragment float4 psNormalLit(VOut in [[stage_in]],
                             sampler samp0 [[sampler(0)]])
 {
     float3 spec;
-    float4 lit = MeshLighting(vc, in.worldRel, normalize(in.worldNormal), spec);
+    float3 N = (dot(in.worldNormal, in.worldNormal) > 1e-8) ? normalize(in.worldNormal) : float3(0.0, 1.0, 0.0);
+    float4 lit = MeshLighting(vc, in.worldRel, N, spec);
     float4 col = tex0.sample(samp0, in.uv0) * lit;
     col.rgb += spec;
 
@@ -338,7 +353,8 @@ fragment float4 psDetailLit(VOut in [[stage_in]],
                             sampler samp1 [[sampler(1)]])
 {
     float3 spec;
-    float4 lit = MeshLighting(vc, in.worldRel, normalize(in.worldNormal), spec);
+    float3 N = (dot(in.worldNormal, in.worldNormal) > 1e-8) ? normalize(in.worldNormal) : float3(0.0, 1.0, 0.0);
+    float4 lit = MeshLighting(vc, in.worldRel, N, spec);
     float4 col = tex0.sample(samp0, in.uv0) * lit;
     col.rgb *= tex1.sample(samp1, in.uv1).a * 2.0;
     col.rgb += spec;
