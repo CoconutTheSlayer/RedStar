@@ -38,6 +38,40 @@ extern void SDLInput_BufferUICharEvent(const char* text);
 namespace Poseidon
 {
 
+// VS/PS constant-block slot indices (vec4 units).  Must match the slot map in
+// Shaders/Shaders.metal (VS_*/PS_* #defines) and EngineGL33's VSConst/PSConst.
+namespace VSlot
+{
+enum
+{
+    Proj = 0,
+    View = 4,
+    SunDir = 12,
+    Ambient = 13,
+    Diffuse = 14,
+    Emissive = 15,
+    Fog = 16,
+    CamPos = 17,
+    Spec = 18,
+    SpecEn = 19,
+    SunEn = 20,
+    VpScale = 21,
+    TexMat0 = 24,
+    TexMat1 = 28,
+    TexCtrl = 32,
+    LightCount = 33,
+};
+} // namespace VSlot
+namespace PSlot
+{
+enum
+{
+    FogColor = 0,
+    AlphaRef = 1,
+    ConstColor = 3,
+};
+} // namespace PSlot
+
 // All Objective-C / Metal state lives here so EngineMetal.hpp stays pure C++.
 struct MetalState
 {
@@ -79,9 +113,8 @@ struct MetalState
     id<MTLRenderPipelineState> psoFlat = nil;   // vsScreen + psFlat (2D)
     id<MTLRenderPipelineState> psoNormal = nil; // vsScreen + psNormal (2D)
     // Sampler table indexed by (point<<2)|(clampU<<0)|(clampV<<1), mirroring
-    // EngineGL33's _samplerObjects[8].  samplerLinear is the repeat/linear entry.
+    // EngineGL33's _samplerObjects[8].
     id<MTLSamplerState> samplers[8] = {};
-    id<MTLSamplerState> samplerLinear = nil;
 
     // 3D mesh (M3)
     id<MTLRenderPipelineState> psoMesh = nil;     // vsTransform + psNormal
@@ -98,10 +131,6 @@ struct MetalState
 
     id<MTLTexture> meshTex = nil; // current section texture (set by PrepareTriangleTL)
     id<MTLTexture> fallbackWhiteTex = nil; // 1x1 white for untextured mesh draws (GL33 parity)
-
-    // M3 debug instrumentation (per-frame mesh draw stats).
-    int dbgMeshDraws = 0;
-    int dbgMeshIndices = 0;
 
     // Triple-buffered dynamic vertex ring for 2D immediate-mode geometry.
     static constexpr int kRingCount = 3;
@@ -287,7 +316,6 @@ static bool LoadShaders(MetalState* m)
         sd.tAddressMode = clampV ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
         m->samplers[i] = [m->device newSamplerStateWithDescriptor:sd];
     }
-    m->samplerLinear = m->samplers[0]; // repeat/repeat/linear (3D world default)
 
     // Stencil for the dark-polygon shadow overlap mask (mirrors GL33):
     //  - non-shadow draws: ALWAYS / REPLACE 0 — every drawn pixel re-zeroes the
@@ -392,8 +420,8 @@ static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MT
     }
 
     float vsConst[70 * 4] = {0};
-    vsConst[21 * 4 + 0] = 2.0f / w;
-    vsConst[21 * 4 + 1] = 2.0f / h;
+    vsConst[VSlot::VpScale * 4 + 0] = 2.0f / w;
+    vsConst[VSlot::VpScale * 4 + 1] = 2.0f / h;
 
     [m->enc setRenderPipelineState:pso];
     [m->enc setDepthStencilState:depthState];
@@ -408,6 +436,13 @@ static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MT
     [m->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:triVerts];
 
     m->ringUsed += need;
+}
+
+// Immediate 2D UI fan: no depth test, clamp+linear sampler (Draw2D/DrawPoly/DrawLine).
+static inline void EmitUI(MetalState* m, const Poseidon::TLVertex* v, int n, id<MTLRenderPipelineState> pso,
+                          id<MTLTexture> tex, int w, int h)
+{
+    EmitPolyFan(m, v, n, pso, tex, w, h, m->dss2D, m->samplers[SamplerIdx(true, true, false)]);
 }
 
 EngineMetal::EngineMetal(int width, int height, bool windowed, int bpp)
@@ -661,11 +696,10 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     [_m->enc setViewport:vp];
 
     _frameConstantsBuilt = false; // rebuild 3D frame constants lazily this frame
-    _in2DPhase = false;           // 3D scene first; interface (2D) phase starts later
     // Sun is on at frame start; the shadow pass toggles it off/on mid-frame.
     // (EnableSunLight(false) must not leak across frames -> unlit world.)
     _sunEnabled = true;
-    _vsShadow[20 * 4] = 1.0f; // VS_SUNEN
+    _vsShadow[VSlot::SunEn * 4] = 1.0f;
 
     Engine::InitDraw();
     _frameOpen = true;
@@ -726,13 +760,6 @@ void EngineMetal::Present()
     {
         [_m->enc endEncoding];
         _m->enc = nil;
-    }
-
-    if (_m->dbgMeshDraws > 0)
-    {
-        LOG_INFO(Graphics, "Metal: frame mesh draws={} indices={}", _m->dbgMeshDraws, _m->dbgMeshIndices);
-        _m->dbgMeshDraws = 0;
-        _m->dbgMeshIndices = 0;
     }
 
     id<CAMetalDrawable> drawable = [_m->layer nextDrawable];
@@ -1021,7 +1048,6 @@ static inline void SetV(Poseidon::TLVertex& v, float x, float y, float z, float 
 
 void EngineMetal::Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Rect2DAbs& clip)
 {
-    _in2DPhase = true; // immediate 2D => we're past the 3D scene this frame
     if (!pars.mip.IsOK() || !_m || !_m->enc)
         return;
     float xBeg = rect.x, xEnd = rect.x + rect.w;
@@ -1052,14 +1078,12 @@ void EngineMetal::Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Re
 
     auto* tm = static_cast<TextureMetal*>(pars.mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, pos, 4, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
-                _m->samplers[SamplerIdx(true, true, false)]);
+    EmitUI(_m, pos, 4, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
 void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DPixel* vertices, int n, const Rect2DPixel& /*clipRect*/,
                            int /*specFlags*/)
 {
-    _in2DPhase = true;
     if (n < 3 || !_m || !_m->enc)
         return;
     const int maxN = 64;
@@ -1074,14 +1098,12 @@ void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DPixel* vertices, in
     }
     auto* tm = static_cast<TextureMetal*>(mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
-                _m->samplers[SamplerIdx(true, true, false)]);
+    EmitUI(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
 void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int n, const Rect2DAbs& /*clipRect*/,
                            int /*specFlags*/)
 {
-    _in2DPhase = true;
     if (n < 3 || !_m || !_m->enc)
         return;
     const int maxN = 64;
@@ -1095,13 +1117,11 @@ void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int 
     }
     auto* tm = static_cast<TextureMetal*>(mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
-                _m->samplers[SamplerIdx(true, true, false)]);
+    EmitUI(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
 void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1, const Rect2DAbs& /*clip*/)
 {
-    _in2DPhase = true;
     if (!_m || !_m->enc)
         return;
     // Render as a 1px-thick quad perpendicular to the line direction.
@@ -1115,7 +1135,7 @@ void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1
     SetV(q[1], x1 + nx, y1 + ny, 0.5f, 1, c1);
     SetV(q[2], x1 - nx, y1 - ny, 0.5f, 1, c1);
     SetV(q[3], x0 - nx, y0 - ny, 0.5f, 1, c0);
-    EmitPolyFan(_m, q, 4, _m->psoFlat, nil, _w, _h, _m->dss2D, _m->samplers[SamplerIdx(true, true, false)]);
+    EmitUI(_m, q, 4, _m->psoFlat, nil, _w, _h);
 }
 
 // ---- 2D TLVertexTable soup path (UI / options notebook) --------------------
@@ -1343,11 +1363,11 @@ void EngineMetal::BuildFrameConstants()
     GfxMatrix view;
     ConvertMatrix(view, cam->InverseScaled());
     view._41 = view._42 = view._43 = 0; // camera-relative
-    memcpy(_vsShadow + 4 * 4, &view, 64); // VS_VIEW
+    memcpy(_vsShadow + VSlot::View * 4, &view, 64);
 
     GfxMatrix proj;
     ConvertProjectionMatrix(proj, cam->ProjectionNormal(), 0);
-    memcpy(_vsShadow + 0 * 4, &proj, 64); // VS_PROJ
+    memcpy(_vsShadow + VSlot::Proj * 4, &proj, 64);
 
     Vector3 pos = cam->Position();
     _cameraPos[0] = (float)pos.X();
@@ -1356,11 +1376,11 @@ void EngineMetal::BuildFrameConstants()
     // Shaders operate in camera-relative space (world matrix has camPos subtracted);
     // GL33's UploadFrameConstants zeroes VS_CAMPOS so fog dist = length(worldPos).
     float cp[4] = {0, 0, 0, 0};
-    memcpy(_vsShadow + 17 * 4, cp, 16); // VS_CAMPOS
+    memcpy(_vsShadow + VSlot::CamPos * 4, cp, 16);
 
     Vector3 dir = sun ? sun->Direction() : Vector3(0, -1, 0);
     float sd[4] = {(float)dir.X(), (float)dir.Y(), (float)dir.Z(), 0};
-    memcpy(_vsShadow + 12 * 4, sd, 16); // VS_SUNDIR
+    memcpy(_vsShadow + VSlot::SunDir * 4, sd, 16);
 
     // sunEn is owned by EnableSunLight + the per-frame reset in InitDraw — don't
     // clobber it here (the shadow pass toggles it off/on mid-frame).
@@ -1370,14 +1390,14 @@ void EngineMetal::BuildFrameConstants()
     fEnd = GScene->GetFogMaxRange();
     float inv = (fEnd > fStart) ? 1.0f / (fEnd - fStart) : 0.0f;
     float fp[4] = {fStart, inv, 1.0f, 0};
-    memcpy(_vsShadow + 16 * 4, fp, 16); // VS_FOG
+    memcpy(_vsShadow + VSlot::Fog * 4, fp, 16);
 
     float tc[4] = {0, 0, 0, 0};
-    memcpy(_vsShadow + 32 * 4, tc, 16); // VS_TEXCTRL (no texgen)
+    memcpy(_vsShadow + VSlot::TexCtrl * 4, tc, 16); // no texgen
 
     ColorVal fog = FogColor();
     float fc[4] = {fog.R(), fog.G(), fog.B(), 1.0f};
-    memcpy(_psShadow + 0 * 4, fc, 16); // PS_FOGCOLOR
+    memcpy(_psShadow + PSlot::FogColor * 4, fc, 16);
 
     _frameConstantsBuilt = true;
 }
@@ -1388,14 +1408,14 @@ void EngineMetal::UpdateProjection()
         return;
     GfxMatrix proj;
     ConvertProjectionMatrix(proj, GScene->GetCamera()->ProjectionNormal(), 0);
-    memcpy(_vsShadow + 0, &proj, 64);
+    memcpy(_vsShadow + VSlot::Proj * 4, &proj, 64);
 }
 
 void EngineMetal::EnableSunLight(bool enable)
 {
     _sunEnabled = enable;
     float se[4] = {enable ? 1.0f : 0.0f, 0, 0, 0};
-    memcpy(_vsShadow + 20 * 4, se, 16);
+    memcpy(_vsShadow + VSlot::SunEn * 4, se, 16);
 }
 
 void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/, const render::LegacySpec& /*spec*/)
@@ -1414,22 +1434,22 @@ void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/
     const Color dif = sunDif * mat.diffuse;
     const Color amb = sunAmb * mat.ambient + sunDif * mat.forcedDiffuse;
 
-    wr(13, amb);          // VS_AMBIENT
-    wr(14, dif);          // VS_DIFFUSE
-    wr(15, mat.emmisive); // VS_EMISSIVE (raw)
+    wr(VSlot::Ambient, amb);
+    wr(VSlot::Diffuse, dif);
+    wr(VSlot::Emissive, mat.emmisive); // raw
     const Color specCol = sunDif * mat.specular;
     float spec[4] = {specCol.R(), specCol.G(), specCol.B(), (float)mat.specularPower};
-    memcpy(_vsShadow + 18 * 4, spec, 16); // VS_SPEC
+    memcpy(_vsShadow + VSlot::Spec * 4, spec, 16);
     float specEn[4] = {mat.specularPower > 0 ? 1.0f : 0.0f, 0, 0, 0};
-    memcpy(_vsShadow + 19 * 4, specEn, 16); // VS_SPECEN
+    memcpy(_vsShadow + VSlot::SpecEn * 4, specEn, 16);
     float lc[4] = {0, 0, 0, 0};
-    memcpy(_vsShadow + 33 * 4, lc, 16); // VS_LIGHTCOUNT = 0 (local lights deferred)
+    memcpy(_vsShadow + VSlot::LightCount * 4, lc, 16); // 0 — local lights deferred
 }
 
 void EngineMetal::FogColorChanged(const Color& c)
 {
     float v[4] = {c.R(), c.G(), c.B(), 1.0f};
-    memcpy(_psShadow + 0 * 4, v, 16); // PS_FOGCOLOR
+    memcpy(_psShadow + PSlot::FogColor * 4, v, 16);
 }
 
 void EngineMetal::PrepareTriangleTL(const MipInfo& mip, const render::LegacySpec& spec)
@@ -1481,15 +1501,12 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
     if (indexCount <= 0)
         return;
 
-    _m->dbgMeshDraws++;
-    _m->dbgMeshIndices += indexCount;
-
     render::BuildContext ctx;
     ctx.isIn3DPass = true;
     const render::RenderPassDescriptor passDesc = render::BuildRenderPassDescriptor(_meshSpec, ctx);
     const bool alphaTest = passDesc.alpha != render::AlphaMode::Disabled;
     float alphaRef[4] = {passDesc.alphaRef / 255.0f, alphaTest ? 1.0f : 0.0f, 0.0f, 0.0f};
-    memcpy(_psShadow + 1 * 4, alphaRef, 16); // PS_ALPHAREF
+    memcpy(_psShadow + PSlot::AlphaRef * 4, alphaRef, 16);
 
     id<MTLTexture> tex = _m->meshTex;
 
@@ -1505,14 +1522,14 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
 
     // Texgen: detail draws sample tex1 at uv0*32 (mirrors GL33 TGDetail: texCtrl.y=1,
     // texMat1 = diag(32,32,32,1)).  Written every draw so non-detail draws reset it.
-    float* texCtrl = _vsShadow + 32 * 4; // VSConst::SlotTexCtrl
+    float* texCtrl = _vsShadow + VSlot::TexCtrl * 4;
     if (detail)
     {
         texCtrl[0] = 0.0f;
         texCtrl[1] = 1.0f;
         texCtrl[2] = 0.0f;
         texCtrl[3] = 0.0f;
-        float* texMat1 = _vsShadow + 28 * 4; // VSConst::SlotTexMat1
+        float* texMat1 = _vsShadow + VSlot::TexMat1 * 4;
         memset(texMat1, 0, 16 * sizeof(float));
         texMat1[0] = texMat1[5] = texMat1[10] = 32.0f;
         texMat1[15] = 1.0f;

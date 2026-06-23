@@ -42,11 +42,6 @@ class EngineMetal : public Engine
     float _curWorld[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // per-mesh world matrix (set in PrepareMeshTL)
     bool _sunEnabled = true;
     bool _frameConstantsBuilt = false;
-    // True once the per-frame 2D interface phase has started (first immediate-2D
-    // draw).  In that phase, soup draws (the options notebook etc.) must ignore
-    // depth so they overlay the 3D scene instead of being occluded by close
-    // geometry like the first-person weapon.
-    bool _in2DPhase = false;
     render::LegacySpec _meshSpec = {};
 
   public:
