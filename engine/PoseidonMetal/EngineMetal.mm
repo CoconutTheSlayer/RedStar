@@ -1404,10 +1404,21 @@ void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/
         float v[4] = {c.R(), c.G(), c.B(), c.A()};
         memcpy(_vsShadow + slot * 4, v, 16);
     };
-    wr(13, mat.ambient);   // VS_AMBIENT
-    wr(14, mat.diffuse);   // VS_DIFFUSE
-    wr(15, mat.emmisive);  // VS_EMISSIVE
-    float spec[4] = {mat.specular.R(), mat.specular.G(), mat.specular.B(), (float)mat.specularPower};
+
+    // Modulate the material by the sun's diffuse/ambient colours (mirrors
+    // EngineGL33::UploadVSMaterialConstants).  Without this the scene ignores the
+    // time-of-day sun colour and always renders at full daylight brightness.
+    LightSun* sun = GScene ? GScene->MainLight() : nullptr;
+    const Color sunDif = sun ? sun->Diffuse() : Color(HWhite);
+    const Color sunAmb = sun ? sun->Ambient() : Color(HWhite);
+    const Color dif = sunDif * mat.diffuse;
+    const Color amb = sunAmb * mat.ambient + sunDif * mat.forcedDiffuse;
+
+    wr(13, amb);          // VS_AMBIENT
+    wr(14, dif);          // VS_DIFFUSE
+    wr(15, mat.emmisive); // VS_EMISSIVE (raw)
+    const Color specCol = sunDif * mat.specular;
+    float spec[4] = {specCol.R(), specCol.G(), specCol.B(), (float)mat.specularPower};
     memcpy(_vsShadow + 18 * 4, spec, 16); // VS_SPEC
     float specEn[4] = {mat.specularPower > 0 ? 1.0f : 0.0f, 0, 0, 0};
     memcpy(_vsShadow + 19 * 4, specEn, 16); // VS_SPECEN
