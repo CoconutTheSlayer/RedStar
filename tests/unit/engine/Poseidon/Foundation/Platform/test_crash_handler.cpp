@@ -52,7 +52,11 @@ TEST_CASE("crash handler writes a symbolizable report on a fatal signal", "[plat
     REQUIRE(report.find("commit ") != std::string::npos);
     REQUIRE(report.find("backtrace:") != std::string::npos);
     REQUIRE(report.find("return addresses:") != std::string::npos);
+#if defined(__linux__)
+    // The memory map dump is sourced from /proc/self/maps, which is Linux-only
+    // (macOS has no /proc; the crash report omits this section there).
     REQUIRE(report.find("/proc/self/maps:") != std::string::npos);
+#endif
 
     remove(path.c_str());
     rmdir(dir.c_str());
