@@ -702,6 +702,91 @@ void Invoke(std::string_view args, std::string& out)
 
 } // namespace Cmd_SpawnLight
 
+// Cmd_Flashlight — like Cmd_SpawnLight but a *spot* (LightReflector ->
+// LTSpotLight) instead of an omni point light: a narrow forward cone that
+// tracks the player's facing (the attach transform follows the vehicle each
+// frame).  The shader gates the spotlight by a fixed ~8-12 deg cone.  This is
+// the lit cone only — it does NOT cast shadows yet (local-light shadow maps
+// are a separate, larger subsystem).
+//
+// Usage:  flashlight            toggle on/off (~14 m full-intensity range)
+//         flashlight <metres>   (re)create at that range, on
+namespace Cmd_Flashlight
+{
+namespace
+{
+Ref<LightReflectorOnVehicle> s_light;
+} // namespace
+
+bool Available()
+{
+    return GScene != nullptr && GWorld != nullptr && GWorld->GetRealPlayer() != nullptr;
+}
+
+void Invoke(std::string_view args, std::string& out)
+{
+    if (!Available())
+    {
+        out = "flashlight: no scene / player";
+        return;
+    }
+    Person* player = GWorld->GetRealPlayer();
+
+    // Optional full-intensity range in metres (the beam still fades out well
+    // past it).  Default ~14 m — a torch beam, not a searchlight.
+    float range = 14.0f;
+    if (!args.empty())
+    {
+        char tmp[32];
+        size_t n = args.size();
+        if (n >= sizeof(tmp))
+        {
+            out = "flashlight: argument too long";
+            return;
+        }
+        std::memcpy(tmp, args.data(), n);
+        tmp[n] = 0;
+        float v = 0.0f;
+        if (sscanf(tmp, "%f", &v) != 1 || v < 1.0f)
+        {
+            out = "flashlight: expected <metres> (>= 1), got: " + std::string(args);
+            return;
+        }
+        range = v;
+    }
+
+    if (!s_light || s_light->AttachedOn() != player || !args.empty())
+    {
+        // Mounted ~1.4 m up (head height), beam forward and slightly down.
+        Vector3 pos(0, 1.4f, 0.2f);
+        Vector3 dir(0, -0.12f, 1.0f);
+        dir.Normalize();
+        Color diffuse(1.0f, 0.96f, 0.86f); // cool-white torch
+        Color ambient(0.0f, 0.0f, 0.0f);   // crisp cone, no ambient wash
+        float coneAngle = H_PI * 0.18f;    // corona size; lit cone is shader-fixed
+        s_light = new LightReflectorOnVehicle(nullptr, diffuse, ambient, player, pos, dir, coneAngle);
+        // SetBrightness(coef): _startAtten = 200 * sqrt(coef / diffuse.Brightness()).
+        // Invert for the requested full-intensity radius.
+        float b = diffuse.Brightness();
+        float k = range / 200.0f;
+        s_light->SetBrightness(b * k * k);
+        s_light->Switch(true);
+        GScene->AddLight(s_light);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "flashlight: ON (spot on player, %.1f m range)", range);
+        out = buf;
+        LOG_INFO(Mission, "DebugCheats::Flashlight -> {}", out);
+        return;
+    }
+
+    bool on = !s_light->IsOn();
+    s_light->Switch(on);
+    out = on ? "flashlight: ON" : "flashlight: OFF";
+    LOG_INFO(Mission, "DebugCheats::Flashlight -> {}", out);
+}
+
+} // namespace Cmd_Flashlight
+
 // Cmd_LoadGame — inverse of Cmd_SaveGame.  Calls World::LoadBin which
 // rehydrates the world from <SaveDir>/save.fps in place.  The path is
 // the one normal "Load Game" menus also go through.
@@ -831,6 +916,9 @@ struct RegisterAll
         DebugCommands::Register({"light", "Spawn/toggle a point light on the player (light [metres]); night only.",
                                  Cmd_SpawnLight::Available, [](std::string_view args, std::string& out)
                                  { Cmd_SpawnLight::Invoke(args, out); }});
+        DebugCommands::Register({"flashlight", "Spawn/toggle a spot cone on the player (flashlight [metres]); night only.",
+                                 Cmd_Flashlight::Available, [](std::string_view args, std::string& out)
+                                 { Cmd_Flashlight::Invoke(args, out); }});
         DebugCommands::Register({"save", "Save current game state to <SaveDir>/save.fps.", Cmd_SaveGame::Available,
                                  [](std::string_view args, std::string& out) { Cmd_SaveGame::Invoke(args, out); }});
         DebugCommands::Register({"load", "Load game state from <SaveDir>/save.fps.", Cmd_LoadGame::Available,
