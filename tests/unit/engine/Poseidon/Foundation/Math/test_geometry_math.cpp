@@ -30,6 +30,9 @@ TEST_CASE("sortTree.hpp: placeholder", "[Math]")
     REQUIRE(true);
 }
 
+// Quatrix.hpp is an SSE quaternion-matrix type (<xmmintrin.h>, __m128), x86-only
+// like the engine's other _KNI/*K math. Skip this smoke test off x86.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <Poseidon/Foundation/Math/Quatrix.hpp>
 TEST_CASE("quatrix.hpp compiles", "[Math]")
 {
@@ -38,6 +41,7 @@ TEST_CASE("quatrix.hpp compiles", "[Math]")
     REQUIRE(sizeof(q4) > 0);
     REQUIRE(sizeof(q3) > 0);
 }
+#endif // x86 (Quatrix.hpp is SSE-only)
 
 #include <Poseidon/Core/HandledList.hpp>
 TEST_CASE("handledList.hpp compiles", "[Math]")

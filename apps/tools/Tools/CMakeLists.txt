@@ -58,6 +58,15 @@ if(WIN32)
             SDL3::SDL3
             winmm
     )
+elseif(APPLE)
+    # ld64 resolves circular static-archive references itself; no --start-group.
+    target_link_libraries(PoseidonTools
+        PRIVATE
+            Poseidon
+            PoseidonOpenAL
+            CLI11::CLI11
+            SDL3::SDL3
+    )
 else()
     target_link_libraries(PoseidonTools
         PRIVATE

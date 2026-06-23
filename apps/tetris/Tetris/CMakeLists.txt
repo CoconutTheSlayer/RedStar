@@ -54,6 +54,11 @@ if(WIN32)
         GameBase Poseidon PoseidonGL33 PoseidonOpenAL
         winmm.lib version.lib ws2_32.lib legacy_stdio_definitions.lib
     )
+elseif(APPLE)
+    # ld64 resolves circular static-archive references itself; no --start-group.
+    target_link_libraries(PoseidonTetris PRIVATE
+        GameBase PoseidonGL33 PoseidonMetal Poseidon PoseidonOpenAL
+    )
 else()
     target_link_libraries(PoseidonTetris PRIVATE
         -Wl,--start-group GameBase PoseidonGL33 Poseidon PoseidonOpenAL -Wl,--end-group

@@ -147,6 +147,30 @@ option(POSEIDON_DISABLE_PCH "Disable precompiled headers (include self-containme
 # preset turns it on. Requires a clang toolchain built with -fsanitize=fuzzer.
 option(POSEIDON_BUILD_FUZZERS "Build libFuzzer network harnesses" OFF)
 
+# Interprocedural optimization (LTO) for optimized builds. The engine is ~1000
+# small TUs with heavy cross-file traffic (Foundation/Math, containers, the SQF
+# Evaluator); LTO lets the compiler inline and devirtualize across that boundary.
+# clang/clang-cl use ThinLTO (-flto=thin) which is cheap to build and stays
+# ccache-friendly, so this is close to a free win.
+#
+# Enabled only for Release and RelWithDebInfo (per-config, so Debug is untouched).
+# Deliberately skipped when sanitizers or fuzzers are active: those presets pin
+# CMAKE_BUILD_TYPE=Release too, and LTO would change their codegen / slow their
+# links for no benefit — POSEIDON_BUILD_FUZZERS covers the fuzz presets and the
+# -fsanitize flag match covers win-x64-clang-san.
+option(POSEIDON_ENABLE_LTO "Enable IPO/ThinLTO for Release and RelWithDebInfo" ON)
+if(POSEIDON_ENABLE_LTO AND NOT POSEIDON_BUILD_FUZZERS AND NOT CMAKE_CXX_FLAGS MATCHES "sanitize")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error LANGUAGES CXX)
+    if(_ipo_supported)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+        message(STATUS "IPO/ThinLTO: enabled for Release and RelWithDebInfo")
+    else()
+        message(STATUS "IPO/ThinLTO: not supported by this toolchain - ${_ipo_error}")
+    endif()
+endif()
+
 configure_file(
     ${CMAKE_SOURCE_DIR}/cmake/BuildConfig.h.in
     ${CMAKE_BINARY_DIR}/generated/BuildConfig.h

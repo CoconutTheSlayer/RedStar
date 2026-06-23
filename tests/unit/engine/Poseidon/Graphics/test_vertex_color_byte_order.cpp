@@ -1,5 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
+// ColorsK.hpp (ColorK/PackedColor) is built on SSE intrinsics (<xmmintrin.h>,
+// __m128) and is x86-only — the engine gates it behind _KNI. This test pulls the
+// header directly to check PackedColor's channel byte order, so it can only build
+// on x86. On other architectures (e.g. arm64) it compiles to an empty TU.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+
 #include <Poseidon/Graphics/Rendering/ColorsK.hpp>
 
 #include <cstdint>
@@ -69,3 +75,5 @@ TEST_CASE("I-31: GLVertexAttribLayouts uses GL_BGRA for color attributes", "[Gra
     // (which would silently swap channels).
     REQUIRE(body.find("GL_RGBA, GL_UNSIGNED_BYTE") == std::string::npos);
 }
+
+#endif // x86 (ColorsK.hpp is SSE-only)
