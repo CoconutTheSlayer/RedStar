@@ -55,6 +55,9 @@ struct MetalState
     id<MTLLibrary> lib = nil;
     id<MTLRenderPipelineState> psoFlat = nil;   // vsScreen + psFlat (2D)
     id<MTLRenderPipelineState> psoNormal = nil; // vsScreen + psNormal (2D)
+    // Sampler table indexed by (point<<2)|(clampU<<0)|(clampV<<1), mirroring
+    // EngineGL33's _samplerObjects[8].  samplerLinear is the repeat/linear entry.
+    id<MTLSamplerState> samplers[8] = {};
     id<MTLSamplerState> samplerLinear = nil;
 
     // 3D mesh (M3)
@@ -195,13 +198,20 @@ static bool LoadShaders(MetalState* m)
     m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
     m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
 
-    MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
-    sd.minFilter = MTLSamplerMinMagFilterLinear;
-    sd.magFilter = MTLSamplerMinMagFilterLinear;
-    sd.mipFilter = MTLSamplerMipFilterLinear;
-    sd.sAddressMode = MTLSamplerAddressModeRepeat;
-    sd.tAddressMode = MTLSamplerAddressModeRepeat;
-    m->samplerLinear = [m->device newSamplerStateWithDescriptor:sd];
+    for (int i = 0; i < 8; i++)
+    {
+        const bool clampU = (i & 1) != 0;
+        const bool clampV = (i & 2) != 0;
+        const bool point = (i & 4) != 0;
+        MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
+        sd.minFilter = point ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+        sd.magFilter = point ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+        sd.mipFilter = point ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+        sd.sAddressMode = clampU ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
+        sd.tAddressMode = clampV ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
+        m->samplers[i] = [m->device newSamplerStateWithDescriptor:sd];
+    }
+    m->samplerLinear = m->samplers[0]; // repeat/repeat/linear (3D world default)
 
     // Depth-stencil states: 3D = LEQUAL + write; 2D = always pass, no write.
     MTLDepthStencilDescriptor* d3 = [[MTLDepthStencilDescriptor alloc] init];
@@ -241,6 +251,12 @@ static bool LoadShaders(MetalState* m)
 // Fan-triangulate n screen-space TLVertices into the current ring buffer and
 // draw them via the given pipeline. tex==nil uses vertex color only (psFlat);
 // a non-nil texture binds tex0+sampler for psNormal.
+// Sampler table index: (point<<2)|(clampU<<0)|(clampV<<1) — matches MetalState::samplers.
+static inline int SamplerIdx(bool clampU, bool clampV, bool point)
+{
+    return (point ? 4 : 0) | (clampU ? 1 : 0) | (clampV ? 2 : 0);
+}
+
 static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MTLRenderPipelineState> pso,
                         id<MTLTexture> tex, int w, int h)
 {
@@ -274,7 +290,9 @@ static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MT
     if (tex)
     {
         [m->enc setFragmentTexture:tex atIndex:0];
-        [m->enc setFragmentSamplerState:m->samplerLinear atIndex:0];
+        // 2D UI clamps both axes (mirrors GL33 forcing ClampU|ClampV) so panel
+        // backgrounds stretch their edge texel instead of tiling across the rect.
+        [m->enc setFragmentSamplerState:m->samplers[SamplerIdx(true, true, false)] atIndex:0];
     }
     [m->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:triVerts];
 
@@ -802,26 +820,42 @@ struct MeshSection
 class VertexBufferMetal : public VertexBuffer
 {
   public:
+    id<MTLDevice> device = nil;
     id<MTLBuffer> vbo = nil;
     id<MTLBuffer> ibo = nil;
+    int vertexCount = 0;
     int indexCount = 0;
+    bool _dynamic = false; // created VBDynamic/VBSmallDiscardable -> re-upload every frame
     std::vector<MeshSection> sections;
 
-    bool Init(id<MTLDevice> dev, const Shape& src)
+    // Pack the shape's current positions/normals/UVs into our interleaved
+    // SVertex layout.  Animation mutates only positions/normals (topology, UVs
+    // and section ranges are stable), so Update() reuses this for re-upload.
+    static void BuildVertices(const Shape& src, std::vector<MetalSVertex>& out)
     {
         const int nv = src.NVertex();
-        if (nv <= 0)
-            return false;
-
-        std::vector<MetalSVertex> verts((size_t)nv);
+        out.resize((size_t)nv);
         for (int i = 0; i < nv; i++)
         {
             const Vector3& p = src.Pos(i);
             const Vector3& n = src.Norm(i);
-            verts[i].pos = Vector3P(p.X(), p.Y(), p.Z());
-            verts[i].norm = Vector3P(-n.X(), -n.Y(), -n.Z()); // negated, matches GL/D3D11
-            verts[i].t0 = src.UV(i);
+            out[i].pos = Vector3P(p.X(), p.Y(), p.Z());
+            out[i].norm = Vector3P(-n.X(), -n.Y(), -n.Z()); // negated, matches GL/D3D11
+            out[i].t0 = src.UV(i);
         }
+    }
+
+    bool Init(id<MTLDevice> dev, const Shape& src, VBType type)
+    {
+        const int nv = src.NVertex();
+        if (nv <= 0)
+            return false;
+        device = dev;
+        vertexCount = nv;
+        _dynamic = (type == VBDynamic || type == VBSmallDiscardable);
+
+        std::vector<MetalSVertex> verts;
+        BuildVertices(src, verts);
         vbo = [dev newBufferWithBytes:verts.data()
                                length:verts.size() * sizeof(MetalSVertex)
                               options:MTLResourceStorageModeShared];
@@ -864,13 +898,35 @@ class VertexBufferMetal : public VertexBuffer
         return true;
     }
 
-    void Update(const Shape& /*src*/, bool /*dynamic*/) override {} // static meshes for now
+    // Re-upload animated vertices each frame (mirrors VertexBufferGL33::Update).
+    // Without this, characters freeze in their bind pose and proxy-attached
+    // weapons stay at the model origin.  A fresh buffer per update is safe with
+    // frames in flight: ARC + the command buffer keep the previous buffer alive
+    // until its GPU work completes.
+    void Update(const Shape& src, bool dynamic) override
+    {
+        // Mirror VertexBufferGL33::Update: re-upload when the buffer was created
+        // dynamic, when this draw is flagged dynamic, or when the engine marked
+        // the vertices dirty (InvalidateBuffer).  The body mesh is created
+        // VBDynamic but its per-draw `dynamic` flag can be false, so gating only
+        // on `dynamic` froze characters while their proxy weapons still moved.
+        if (!(_dynamic || dynamic || bufferDirty) || !device || vertexCount <= 0)
+            return;
+        if (src.NVertex() != vertexCount)
+            return; // topology changed unexpectedly — keep the existing buffer
+        std::vector<MetalSVertex> verts;
+        BuildVertices(src, verts);
+        vbo = [device newBufferWithBytes:verts.data()
+                                  length:verts.size() * sizeof(MetalSVertex)
+                                 options:MTLResourceStorageModeShared];
+        bufferDirty = false;
+    }
 };
 
-VertexBuffer* EngineMetal::CreateVertexBuffer(const Shape& src, VBType /*type*/)
+VertexBuffer* EngineMetal::CreateVertexBuffer(const Shape& src, VBType type)
 {
     auto* buf = new VertexBufferMetal();
-    if (buf->Init(_m->device, src))
+    if (buf->Init(_m->device, src, type))
         return buf;
     delete buf;
     return nullptr;
@@ -990,7 +1046,14 @@ void EngineMetal::PrepareMeshTL(const LightList& /*lights*/, const Matrix4& mode
     memcpy(_curWorld, &world, 64);
 }
 
-void EngineMetal::BeginMeshTL(const Shape& /*sMesh*/, int /*spec*/, bool /*dynamic*/) {}
+void EngineMetal::BeginMeshTL(const Shape& sMesh, int /*spec*/, bool dynamic)
+{
+    // Re-upload animated meshes from their current (CPU-skinned) vertices.
+    // Mirrors EngineGL33::BeginMeshTL — without it, characters freeze in bind
+    // pose and proxy weapons render at the model origin.
+    if (VertexBuffer* vb = sMesh.GetVertexBuffer())
+        vb->Update(sMesh, dynamic);
+}
 void EngineMetal::EndMeshTL(const Shape& /*sMesh*/) {}
 
 void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
@@ -1058,19 +1121,30 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
                                                      : _m->psoMesh;
     [_m->enc setRenderPipelineState:pso];
     [_m->enc setDepthStencilState:(noZWrite ? _m->dss3DNoWrite : _m->dss3D)];
+    // Roads / decals / footprints are coplanar with the terrain — pull them
+    // toward the camera with a depth bias so they win the LEQUAL test instead of
+    // z-fighting (black flicker).  Mirrors GL33's glPolygonOffset(-1,-1) for
+    // OnSurface decals.  Reset to 0 for every other draw (encoder state sticks).
+    if (passDesc.surface == render::SurfaceMode::OnSurface)
+        [_m->enc setDepthBias:-1.0f slopeScale:-1.0f clamp:0.0f];
+    else
+        [_m->enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
     [_m->enc setCullMode:MTLCullModeNone];
     [_m->enc setVertexBuffer:buf->vbo offset:0 atIndex:0];
     [_m->enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
     [_m->enc setVertexBytes:_curWorld length:64 atIndex:2]; // per-draw world matrix (WorldInstances[0])
     if (tex)
     {
+        const bool point = passDesc.sampler.filter == render::SamplerFilter::Point;
+        id<MTLSamplerState> samp = _m->samplers[SamplerIdx(passDesc.sampler.clampU, passDesc.sampler.clampV, point)];
         [_m->enc setFragmentBytes:_psShadow length:sizeof(_psShadow) atIndex:1];
         [_m->enc setFragmentTexture:tex atIndex:0];
-        [_m->enc setFragmentSamplerState:_m->samplerLinear atIndex:0];
+        [_m->enc setFragmentSamplerState:samp atIndex:0];
         if (detail)
         {
+            // Detail texture always tiles (uv0*32) — force the repeat sampler.
             [_m->enc setFragmentTexture:detailTex atIndex:1];
-            [_m->enc setFragmentSamplerState:_m->samplerLinear atIndex:1];
+            [_m->enc setFragmentSamplerState:_m->samplers[SamplerIdx(false, false, point)] atIndex:1];
         }
     }
     [_m->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle

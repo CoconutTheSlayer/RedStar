@@ -95,8 +95,8 @@ class EngineMetal : public Engine
     // --- Depth / bias caps ---
     bool CanZBias() const override { return false; }
     bool ZBiasExclusion() const override { return false; }
-    float ZShadowEpsilon() const override { return 0; }
-    float ZRoadEpsilon() const override { return 0; }
+    float ZShadowEpsilon() const override { return 0.01f; }
+    float ZRoadEpsilon() const override { return 0.005f; }
     float ObjMipmapCoef() const override { return 1; }
     int GetBias() override { return 0; }
     void SetBias(int) override {}
