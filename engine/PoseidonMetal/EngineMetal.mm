@@ -76,10 +76,12 @@ struct MetalState
     id<MTLRenderPipelineState> psoMeshBlend = nil; // vsTransform + psNormal + alpha blend
     id<MTLRenderPipelineState> psoMeshDetail = nil; // vsTransform + psDetail (terrain base*detail)
     id<MTLRenderPipelineState> psoMeshFlat = nil; // vsTransform + psFlat
+    id<MTLRenderPipelineState> psoMeshShadow = nil; // vsShadow + psShadow (dark projected polygon)
     id<MTLTexture> depthTex = nil;
     id<MTLDepthStencilState> dss3D = nil; // LEQUAL + write (DepthMode::Normal)
     id<MTLDepthStencilState> dss3DNoWrite = nil; // LEQUAL, no write (NoZWrite surfaces)
     id<MTLDepthStencilState> dss2D = nil; // always pass, no write
+    id<MTLDepthStencilState> dssShadow = nil; // LEQUAL no-write, stencil EQUAL 0 / INCR
     int depthW = 0, depthH = 0;
 
     id<MTLTexture> meshTex = nil; // current section texture (set by PrepareTriangleTL)
@@ -144,8 +146,19 @@ static MTLVertexDescriptor* MakeSVertexDescriptor()
     return vd;
 }
 
+// Depth+stencil format used by every render pass — stencil is needed for the
+// dark-polygon shadow overlap mask (EQUAL 0 / INCR).
+static constexpr MTLPixelFormat kDepthStencilFormat = MTLPixelFormatDepth32Float_Stencil8;
+
+enum class MtlBlend
+{
+    None,   // opaque
+    Alpha,  // src.a, 1-src.a (standard alpha)
+    Shadow, // RGB: (ZERO, 1-src.a) => dst*=(1-a) darken; A: (ONE, ZERO)
+};
+
 static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib, const char* vsName,
-                                          const char* psName, MTLPixelFormat colorFmt, bool blend,
+                                          const char* psName, MTLPixelFormat colorFmt, MtlBlend blend,
                                           MTLVertexDescriptor* vdesc)
 {
     id<MTLFunction> vs = [lib newFunctionWithName:[NSString stringWithUTF8String:vsName]];
@@ -159,9 +172,10 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
     pd.vertexFunction = vs;
     pd.fragmentFunction = ps;
     pd.vertexDescriptor = vdesc;
-    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float; // render pass carries depth
+    pd.depthAttachmentPixelFormat = kDepthStencilFormat; // render pass carries depth+stencil
+    pd.stencilAttachmentPixelFormat = kDepthStencilFormat;
     pd.colorAttachments[0].pixelFormat = colorFmt;
-    if (blend)
+    if (blend == MtlBlend::Alpha)
     {
         pd.colorAttachments[0].blendingEnabled = YES;
         pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
@@ -170,6 +184,16 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
         pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
         pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    else if (blend == MtlBlend::Shadow)
+    {
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorZero;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
     }
     NSError* err = nil;
     id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
@@ -202,12 +226,14 @@ static bool LoadShaders(MetalState* m)
 
     MTLVertexDescriptor* tlDesc = MakeTLVertexDescriptor();
     MTLVertexDescriptor* svDesc = MakeSVertexDescriptor();
-    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, true, tlDesc);
-    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, true, MakeTLVertexDescriptor());
-    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, false, svDesc);
-    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, true, MakeSVertexDescriptor());
-    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
-    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
+    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, tlDesc);
+    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, MakeTLVertexDescriptor());
+    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::None, svDesc);
+    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, MakeSVertexDescriptor());
+    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", MTLPixelFormatBGRA8Unorm, MtlBlend::None, MakeSVertexDescriptor());
+    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, MtlBlend::None, MakeSVertexDescriptor());
+    // Dark-polygon sun shadow: black + shadowFactor alpha, ZERO/1-srcA darken blend.
+    m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", MTLPixelFormatBGRA8Unorm, MtlBlend::Shadow, MakeSVertexDescriptor());
 
     for (int i = 0; i < 8; i++)
     {
@@ -224,19 +250,54 @@ static bool LoadShaders(MetalState* m)
     }
     m->samplerLinear = m->samplers[0]; // repeat/repeat/linear (3D world default)
 
+    // Stencil for the dark-polygon shadow overlap mask (mirrors GL33):
+    //  - non-shadow draws: ALWAYS / REPLACE 0 — every drawn pixel re-zeroes the
+    //    mask so the next caster's shadow starts clean.
+    //  - shadow draws: EQUAL 0 / INCR — darken a receiver pixel at most once per
+    //    caster (overlapping projected polys of one caster then fail).
+    auto resetStencil = [] {
+        MTLStencilDescriptor* s = [[MTLStencilDescriptor alloc] init];
+        s.stencilCompareFunction = MTLCompareFunctionAlways;
+        s.stencilFailureOperation = MTLStencilOperationKeep;
+        s.depthFailureOperation = MTLStencilOperationKeep;
+        s.depthStencilPassOperation = MTLStencilOperationReplace; // write ref (0)
+        s.readMask = 0xFF;
+        s.writeMask = 0xFF;
+        return s;
+    };
+
     // Depth-stencil states: 3D = LEQUAL + write; 2D = always pass, no write.
     MTLDepthStencilDescriptor* d3 = [[MTLDepthStencilDescriptor alloc] init];
     d3.depthCompareFunction = MTLCompareFunctionLessEqual;
     d3.depthWriteEnabled = YES;
+    d3.frontFaceStencil = resetStencil();
+    d3.backFaceStencil = resetStencil();
     m->dss3D = [m->device newDepthStencilStateWithDescriptor:d3];
     MTLDepthStencilDescriptor* d3nw = [[MTLDepthStencilDescriptor alloc] init];
     d3nw.depthCompareFunction = MTLCompareFunctionLessEqual;
     d3nw.depthWriteEnabled = NO;
+    d3nw.frontFaceStencil = resetStencil();
+    d3nw.backFaceStencil = resetStencil();
     m->dss3DNoWrite = [m->device newDepthStencilStateWithDescriptor:d3nw];
     MTLDepthStencilDescriptor* d2 = [[MTLDepthStencilDescriptor alloc] init];
     d2.depthCompareFunction = MTLCompareFunctionAlways;
     d2.depthWriteEnabled = NO;
     m->dss2D = [m->device newDepthStencilStateWithDescriptor:d2];
+
+    // Shadow: LEQUAL, no depth write, stencil EQUAL 0 then INCR.
+    MTLStencilDescriptor* sShadow = [[MTLStencilDescriptor alloc] init];
+    sShadow.stencilCompareFunction = MTLCompareFunctionEqual;
+    sShadow.stencilFailureOperation = MTLStencilOperationKeep;
+    sShadow.depthFailureOperation = MTLStencilOperationKeep;
+    sShadow.depthStencilPassOperation = MTLStencilOperationIncrementClamp;
+    sShadow.readMask = 0xFF;
+    sShadow.writeMask = 0xFF;
+    MTLDepthStencilDescriptor* dsh = [[MTLDepthStencilDescriptor alloc] init];
+    dsh.depthCompareFunction = MTLCompareFunctionLessEqual;
+    dsh.depthWriteEnabled = NO;
+    dsh.frontFaceStencil = sShadow;
+    dsh.backFaceStencil = sShadow;
+    m->dssShadow = [m->device newDepthStencilStateWithDescriptor:dsh];
 
     // 1x1 white fallback (matches GL33 _fallbackWhiteTex).
     {
@@ -462,7 +523,7 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     EnsureFrameTex(_m, _w, _h);
     if (!_m->depthTex || _m->depthW != _w || _m->depthH != _h)
     {
-        MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthStencilFormat
                                                                                      width:_w
                                                                                     height:_h
                                                                                  mipmapped:NO];
@@ -493,6 +554,10 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.storeAction = MTLStoreActionStore; // preserved across mid-frame Clear() pass restarts
     rp.depthAttachment.clearDepth = 1.0;                  // Metal NDC depth [0,1], far = 1
+    rp.stencilAttachment.texture = _m->depthTex;          // shared depth+stencil texture
+    rp.stencilAttachment.loadAction = MTLLoadActionClear; // shadow overlap mask starts at 0
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.clearStencil = 0;
 
     // Persistent per-frame render encoder; draw calls record into it until Present.
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
@@ -540,6 +605,10 @@ void EngineMetal::Clear(bool clearZ, bool clearColor, PackedColor color)
     rp.depthAttachment.loadAction = clearZ ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
     rp.depthAttachment.clearDepth = 1.0;
+    rp.stencilAttachment.texture = _m->depthTex;
+    rp.stencilAttachment.loadAction = clearZ ? MTLLoadActionClear : MTLLoadActionLoad; // clear mask with depth
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.clearStencil = 0;
 
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
     MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
@@ -1283,20 +1352,37 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
         texCtrl[0] = texCtrl[1] = texCtrl[2] = texCtrl[3] = 0.0f;
     }
 
+    const bool isShadow = passDesc.shader == render::ShaderFamily::Shadow;
     const bool useBlend = passDesc.blend != render::BlendMode::Opaque || passDesc.alpha == render::AlphaMode::Blend ||
                           passDesc.alpha == render::AlphaMode::TestAndBlend;
     const bool noZWrite = passDesc.depth == render::DepthMode::ReadOnly || passDesc.depth == render::DepthMode::Disabled;
-    id<MTLRenderPipelineState> pso = !tex            ? _m->psoMeshFlat
-                                     : detail        ? _m->psoMeshDetail
-                                     : useBlend      ? _m->psoMeshBlend
-                                                     : _m->psoMesh;
+
+    id<MTLRenderPipelineState> pso;
+    id<MTLDepthStencilState> dss;
+    if (isShadow)
+    {
+        pso = _m->psoMeshShadow;
+        dss = _m->dssShadow; // LEQUAL no-write + stencil EQUAL 0 / INCR
+    }
+    else
+    {
+        pso = !tex       ? _m->psoMeshFlat
+              : detail   ? _m->psoMeshDetail
+              : useBlend ? _m->psoMeshBlend
+                         : _m->psoMesh;
+        dss = noZWrite ? _m->dss3DNoWrite : _m->dss3D;
+    }
     [_m->enc setRenderPipelineState:pso];
-    [_m->enc setDepthStencilState:(noZWrite ? _m->dss3DNoWrite : _m->dss3D)];
-    // Roads / decals / footprints are coplanar with the terrain — pull them
-    // toward the camera with a depth bias so they win the LEQUAL test instead of
-    // z-fighting (black flicker).  Mirrors GL33's glPolygonOffset(-1,-1) for
-    // OnSurface decals.  Reset to 0 for every other draw (encoder state sticks).
-    if (passDesc.surface == render::SurfaceMode::OnSurface)
+    [_m->enc setDepthStencilState:dss];
+    [_m->enc setStencilReferenceValue:0]; // shadow EQUAL-0 / non-shadow REPLACE-0 reference
+
+    // Depth bias: shadows are projected onto the (uneven) terrain — a large
+    // angle-independent offset keeps them winning the LEQUAL test without acne
+    // (mirrors GL33 glPolygonOffset(-1,-64)).  Roads/decals use a smaller offset
+    // (glPolygonOffset(-1,-1)).  Reset to 0 otherwise (encoder state sticks).
+    if (isShadow)
+        [_m->enc setDepthBias:-64.0f slopeScale:-1.0f clamp:0.0f];
+    else if (passDesc.surface == render::SurfaceMode::OnSurface)
         [_m->enc setDepthBias:-1.0f slopeScale:-1.0f clamp:0.0f];
     else
         [_m->enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];

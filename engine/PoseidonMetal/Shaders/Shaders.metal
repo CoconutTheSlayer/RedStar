@@ -162,6 +162,47 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     return o;
 }
 
+// ---- Dark-polygon sun shadow (mirrors GL33 vsShadow/psShadow) ----
+// The engine projects each caster onto the ground and re-draws it as a flat,
+// unlit polygon whose colour is the black + shadowFactor-alpha shadow material
+// (SetMaterial writes it to VS_DIFFUSE).  psShadow emits (0,0,0,a) and the
+// Shadow blend (ZERO, 1-srcA) darkens the framebuffer: dst' = dst*(1-a).
+vertex VOut vsShadow(SVertexIn vin [[stage_in]],
+                     constant VSConstants& vc [[buffer(1)]],
+                     constant WorldInstances& wi [[buffer(2)]],
+                     uint iid [[instance_id]])
+{
+    float4x4 proj = mat4At(vc, VS_PROJ);
+    float4x4 view = mat4At(vc, VS_VIEW);
+    float4x4 world = wi.world[iid];
+    float4 worldPos = world * float4(vin.pos, 1.0);
+
+    VOut o;
+    o.position = proj * (view * worldPos);
+    o.color = vc.reg[VS_DIFFUSE]; // black RGB, shadowFactor alpha
+    o.spec = float4(0.0);
+    float4 texCtrl = vc.reg[VS_TEXCTRL];
+    o.uv0 = (texCtrl.x > 0.5) ? (mat4At(vc, VS_TEXMAT0) * float4(vin.uv, 0, 1)).xy : vin.uv;
+    o.uv1 = o.uv0;
+    o.fogTC = 1.0; // shadows ignore fog
+    o.worldRel = float3(0.0);
+    return o;
+}
+
+fragment float4 psShadow(VOut in [[stage_in]],
+                         constant PSConstants& pc [[buffer(1)]],
+                         texture2d<float> tex0 [[texture(0)]],
+                         sampler samp0 [[sampler(0)]])
+{
+    // Opaque casters bind a 1x1 white texture (alpha 1); foliage casters keep
+    // their texture so the cutout silhouette discards transparent texels.
+    float a = in.color.a * tex0.sample(samp0, in.uv0).a;
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+    return float4(0.0, 0.0, 0.0, a);
+}
+
 // ---- Fragment ----
 fragment float4 psFlat(VOut in [[stage_in]])
 {
