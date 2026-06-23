@@ -2,12 +2,10 @@
 
 // TextureMetal / TextBankMetal — Metal texture + bank.
 //
-// Strategy: report no DXT/compressed support, so every mip's destination format
-// is set to PacARGB8888. The shared PAA/PAC decoder (ITextureSource) then expands
-// DXT and all packed formats to 32-bit BGRA at GetMipmapData() time — no
-// GPU-side decompression needed (Apple Silicon Metal has no BC formats anyway).
-// Upload is one MTLPixelFormatBGRA8Unorm texture per source, all mips resident
-// (no streaming/LRU — fine for this era of game on unified-memory Macs).
+// Strategy: mirror GL33's per-source DstFormat selection so the shared PAA/PAC
+// decoder expands each format correctly (P8 -> ARGB1555, DXT -> ARGB8888, etc.).
+// CPU upload always converts decoded pixels to MTLPixelFormatBGRA8Unorm — Metal
+// has no BC/DXT formats on Apple Silicon.
 //
 // ObjC++ header: included only by .mm TUs in PoseidonMetal.
 
@@ -79,8 +77,8 @@ class TextureMetal : public Texture
     int ANMipmaps() const override { return _nMipmaps; }
     AbstractMipmapLevel& AMipmap(int level) override { return _mipmaps[level]; }
     const AbstractMipmapLevel& AMipmap(int level) const override { return _mipmaps[level]; }
-    void ASetNMipmaps(int n) override { _nMipmaps = n; }
-    Color GetPixel(int /*level*/, float /*u*/, float /*v*/) const override { return HBlack; }
+    void ASetNMipmaps(int n) override;
+    Color GetPixel(int level, float u, float v) const override;
     bool IsTransparent() const override { return _src && _src->IsTransparent(); }
     Color GetColor() override
     {
@@ -94,12 +92,18 @@ class TextureMetal : public Texture
 class TextBankMetal : public AbstractTextBank
 {
     RefArray<TextureMetal> _texture;
+    Ref<TextureMetal> _detail; // global terrain detail texture (CfgDetailTextures>>"detail")
+    bool _detailTried = false;
     id<MTLDevice> _device = nil;
 
     int Find(RStringB name) const;
 
   public:
     explicit TextBankMetal(id<MTLDevice> dev) : _device(dev) {}
+
+    // Global detail texture, sampled at unit 1 by psDetail for terrain.  Loaded
+    // and uploaded lazily on first use (mirrors TextBankGL33::InitDetailTextures).
+    id<MTLTexture> DetailMetalTexture();
 
     Ref<Texture> Load(RStringB name) override;
     Ref<Texture> LoadInterpolated(RStringB n1, RStringB n2, float factor) override;

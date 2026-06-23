@@ -32,6 +32,7 @@ struct WorldInstances { float4x4 world[256]; };
 
 // PSConstants
 #define PS_FOGCOLOR 0
+#define PS_ALPHAREF 1
 #define PS_CONSTCOLOR 3
 
 static inline float4x4 mat4At(constant VSConstants& c, int slot)
@@ -175,7 +176,36 @@ fragment float4 psNormal(VOut in [[stage_in]],
     float4 t = tex0.sample(samp0, in.uv0);
     float4 col = t * in.color;
     col.rgb += in.spec.rgb;
-    // Fog blend deferred (needs correct fog colour/range — M5/polish); applying it
-    // with an unset fog colour currently crushes the scene to black.
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
+    return col;
+}
+
+// ---- Multitextured detail (terrain): base tex0(uv0) * detail tex1(uv1) ----
+// Mirrors GL33 psDetail: the detail texture's alpha, doubled, modulates the base
+// colour ("rgb *= t1.a * 2.0" — a signed-around-0.5 modulate that adds the
+// high-frequency surface detail).  uv1 = uv0 * 32 (see vsTransform texgen).
+fragment float4 psDetail(VOut in [[stage_in]],
+                         constant PSConstants& pc [[buffer(1)]],
+                         texture2d<float> tex0 [[texture(0)]],
+                         sampler samp0 [[sampler(0)]],
+                         texture2d<float> tex1 [[texture(1)]],
+                         sampler samp1 [[sampler(1)]])
+{
+    float4 t0 = tex0.sample(samp0, in.uv0);
+    float4 t1 = tex1.sample(samp1, in.uv1);
+    float4 col = t0 * in.color;
+    col.rgb *= t1.a * 2.0;
+    col.rgb += in.spec.rgb;
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
     return col;
 }

@@ -7,6 +7,8 @@
 #include <Poseidon/Graphics/Core/MatrixConversion.hpp>
 #include <Poseidon/Graphics/Rendering/Primitives/Vertex.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
+#include <Poseidon/Graphics/Rendering/RenderFlags.hpp>
+#include <Poseidon/Graphics/Rendering/BuildRenderPassDescriptor.hpp>
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/Core/Application.hpp>
@@ -57,14 +59,17 @@ struct MetalState
 
     // 3D mesh (M3)
     id<MTLRenderPipelineState> psoMesh = nil;     // vsTransform + psNormal
+    id<MTLRenderPipelineState> psoMeshBlend = nil; // vsTransform + psNormal + alpha blend
+    id<MTLRenderPipelineState> psoMeshDetail = nil; // vsTransform + psDetail (terrain base*detail)
     id<MTLRenderPipelineState> psoMeshFlat = nil; // vsTransform + psFlat
     id<MTLTexture> depthTex = nil;
     id<MTLDepthStencilState> dss3D = nil; // LEQUAL + write (DepthMode::Normal)
+    id<MTLDepthStencilState> dss3DNoWrite = nil; // LEQUAL, no write (NoZWrite surfaces)
     id<MTLDepthStencilState> dss2D = nil; // always pass, no write
-    id<MTLBuffer> worldUBO = nil;         // WorldInstances (256 mat4)
     int depthW = 0, depthH = 0;
 
     id<MTLTexture> meshTex = nil; // current section texture (set by PrepareTriangleTL)
+    id<MTLTexture> fallbackWhiteTex = nil; // 1x1 white for untextured mesh draws (GL33 parity)
 
     // M3 debug instrumentation (per-frame mesh draw stats).
     int dbgMeshDraws = 0;
@@ -186,6 +191,8 @@ static bool LoadShaders(MetalState* m)
     m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, true, tlDesc);
     m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, true, MakeTLVertexDescriptor());
     m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, false, svDesc);
+    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, true, MakeSVertexDescriptor());
+    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
     m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, false, MakeSVertexDescriptor());
 
     MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
@@ -201,12 +208,31 @@ static bool LoadShaders(MetalState* m)
     d3.depthCompareFunction = MTLCompareFunctionLessEqual;
     d3.depthWriteEnabled = YES;
     m->dss3D = [m->device newDepthStencilStateWithDescriptor:d3];
+    MTLDepthStencilDescriptor* d3nw = [[MTLDepthStencilDescriptor alloc] init];
+    d3nw.depthCompareFunction = MTLCompareFunctionLessEqual;
+    d3nw.depthWriteEnabled = NO;
+    m->dss3DNoWrite = [m->device newDepthStencilStateWithDescriptor:d3nw];
     MTLDepthStencilDescriptor* d2 = [[MTLDepthStencilDescriptor alloc] init];
     d2.depthCompareFunction = MTLCompareFunctionAlways;
     d2.depthWriteEnabled = NO;
     m->dss2D = [m->device newDepthStencilStateWithDescriptor:d2];
 
-    m->worldUBO = [m->device newBufferWithLength:256 * 64 options:MTLResourceStorageModeShared];
+    // 1x1 white fallback (matches GL33 _fallbackWhiteTex).
+    {
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:1
+                                                              height:1
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        m->fallbackWhiteTex = [m->device newTextureWithDescriptor:td];
+        const uint8_t white[4] = {255, 255, 255, 255};
+        [m->fallbackWhiteTex replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                              mipmapLevel:0
+                                withBytes:white
+                              bytesPerRow:4];
+    }
 
     LOG_INFO(Graphics, "Metal: shaders loaded (2D={}, mesh={})", m->psoFlat != nil, m->psoMesh != nil);
     return m->psoFlat != nil && m->psoMesh != nil;
@@ -869,7 +895,12 @@ void EngineMetal::BuildFrameConstants()
     memcpy(_vsShadow + 0 * 4, &proj, 64); // VS_PROJ
 
     Vector3 pos = cam->Position();
-    float cp[4] = {(float)pos.X(), (float)pos.Y(), (float)pos.Z(), 0};
+    _cameraPos[0] = (float)pos.X();
+    _cameraPos[1] = (float)pos.Y();
+    _cameraPos[2] = (float)pos.Z();
+    // Shaders operate in camera-relative space (world matrix has camPos subtracted);
+    // GL33's UploadFrameConstants zeroes VS_CAMPOS so fog dist = length(worldPos).
+    float cp[4] = {0, 0, 0, 0};
     memcpy(_vsShadow + 17 * 4, cp, 16); // VS_CAMPOS
 
     Vector3 dir = sun ? sun->Direction() : Vector3(0, -1, 0);
@@ -888,6 +919,10 @@ void EngineMetal::BuildFrameConstants()
 
     float tc[4] = {0, 0, 0, 0};
     memcpy(_vsShadow + 32 * 4, tc, 16); // VS_TEXCTRL (no texgen)
+
+    ColorVal fog = FogColor();
+    float fc[4] = {fog.R(), fog.G(), fog.B(), 1.0f};
+    memcpy(_psShadow + 0 * 4, fc, 16); // PS_FOGCOLOR
 
     _frameConstantsBuilt = true;
 }
@@ -931,10 +966,12 @@ void EngineMetal::FogColorChanged(const Color& c)
     memcpy(_psShadow + 0 * 4, v, 16); // PS_FOGCOLOR
 }
 
-void EngineMetal::PrepareTriangleTL(const MipInfo& mip, const render::LegacySpec&)
+void EngineMetal::PrepareTriangleTL(const MipInfo& mip, const render::LegacySpec& spec)
 {
     auto* tm = static_cast<TextureMetal*>(mip._texture);
-    _m->meshTex = tm ? tm->MetalTexture() : nil;
+    id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
+    _m->meshTex = tex ? tex : _m->fallbackWhiteTex;
+    _meshSpec = spec;
 }
 
 void EngineMetal::PrepareMeshTL(const LightList& /*lights*/, const Matrix4& modelToWorld, const render::LegacySpec&)
@@ -942,11 +979,15 @@ void EngineMetal::PrepareMeshTL(const LightList& /*lights*/, const Matrix4& mode
     BuildFrameConstants();
     GfxMatrix world;
     ConvertMatrix(world, modelToWorld);
-    world._41 -= _vsShadow[17 * 4 + 0]; // camera-relative (subtract camPos)
-    world._42 -= _vsShadow[17 * 4 + 1];
-    world._43 -= _vsShadow[17 * 4 + 2];
-    if (_m->worldUBO)
-        memcpy([_m->worldUBO contents], &world, 64); // WorldInstances slot 0
+    world._41 -= _cameraPos[0];
+    world._42 -= _cameraPos[1];
+    world._43 -= _cameraPos[2];
+    // Stash this mesh's world matrix; DrawSectionTL uploads it per-draw via
+    // setVertexBytes.  A single shared worldUBO slot would be overwritten by the
+    // NEXT object's PrepareMeshTL before the GPU executes this object's draws
+    // (all draws recorded into one command buffer read the buffer at execution
+    // time) — collapsing every object onto the last object's transform.
+    memcpy(_curWorld, &world, 64);
 }
 
 void EngineMetal::BeginMeshTL(const Shape& /*sMesh*/, int /*spec*/, bool /*dynamic*/) {}
@@ -970,18 +1011,67 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
     _m->dbgMeshDraws++;
     _m->dbgMeshIndices += indexCount;
 
+    render::BuildContext ctx;
+    ctx.isIn3DPass = true;
+    const render::RenderPassDescriptor passDesc = render::BuildRenderPassDescriptor(_meshSpec, ctx);
+    const bool alphaTest = passDesc.alpha != render::AlphaMode::Disabled;
+    float alphaRef[4] = {passDesc.alphaRef / 255.0f, alphaTest ? 1.0f : 0.0f, 0.0f, 0.0f};
+    memcpy(_psShadow + 1 * 4, alphaRef, 16); // PS_ALPHAREF
+
     id<MTLTexture> tex = _m->meshTex;
-    [_m->enc setRenderPipelineState:(tex ? _m->psoMesh : _m->psoMeshFlat)];
-    [_m->enc setDepthStencilState:_m->dss3D];
+
+    // Terrain (and other multitextured surfaces) flag Backend::DetailTexture; GL33
+    // binds a single global detail texture to unit 1 and runs psDetail, with the
+    // detail UV scaled 32x (TGDetail texgen).  Without it terrain shows only the
+    // smooth base texture -> blurry.  Fall back to psNormal if the detail texture
+    // is unavailable.
+    id<MTLTexture> detailTex = (tex && render::Has(_meshSpec.backend, render::Backend::DetailTexture) && _bank)
+                                   ? _bank->DetailMetalTexture()
+                                   : nil;
+    const bool detail = detailTex != nil;
+
+    // Texgen: detail draws sample tex1 at uv0*32 (mirrors GL33 TGDetail: texCtrl.y=1,
+    // texMat1 = diag(32,32,32,1)).  Written every draw so non-detail draws reset it.
+    float* texCtrl = _vsShadow + 32 * 4; // VSConst::SlotTexCtrl
+    if (detail)
+    {
+        texCtrl[0] = 0.0f;
+        texCtrl[1] = 1.0f;
+        texCtrl[2] = 0.0f;
+        texCtrl[3] = 0.0f;
+        float* texMat1 = _vsShadow + 28 * 4; // VSConst::SlotTexMat1
+        memset(texMat1, 0, 16 * sizeof(float));
+        texMat1[0] = texMat1[5] = texMat1[10] = 32.0f;
+        texMat1[15] = 1.0f;
+    }
+    else
+    {
+        texCtrl[0] = texCtrl[1] = texCtrl[2] = texCtrl[3] = 0.0f;
+    }
+
+    const bool useBlend = passDesc.blend != render::BlendMode::Opaque || passDesc.alpha == render::AlphaMode::Blend ||
+                          passDesc.alpha == render::AlphaMode::TestAndBlend;
+    const bool noZWrite = passDesc.depth == render::DepthMode::ReadOnly || passDesc.depth == render::DepthMode::Disabled;
+    id<MTLRenderPipelineState> pso = !tex            ? _m->psoMeshFlat
+                                     : detail        ? _m->psoMeshDetail
+                                     : useBlend      ? _m->psoMeshBlend
+                                                     : _m->psoMesh;
+    [_m->enc setRenderPipelineState:pso];
+    [_m->enc setDepthStencilState:(noZWrite ? _m->dss3DNoWrite : _m->dss3D)];
     [_m->enc setCullMode:MTLCullModeNone];
     [_m->enc setVertexBuffer:buf->vbo offset:0 atIndex:0];
     [_m->enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
-    [_m->enc setVertexBuffer:_m->worldUBO offset:0 atIndex:2];
+    [_m->enc setVertexBytes:_curWorld length:64 atIndex:2]; // per-draw world matrix (WorldInstances[0])
     if (tex)
     {
         [_m->enc setFragmentBytes:_psShadow length:sizeof(_psShadow) atIndex:1];
         [_m->enc setFragmentTexture:tex atIndex:0];
         [_m->enc setFragmentSamplerState:_m->samplerLinear atIndex:0];
+        if (detail)
+        {
+            [_m->enc setFragmentTexture:detailTex atIndex:1];
+            [_m->enc setFragmentSamplerState:_m->samplerLinear atIndex:1];
+        }
     }
     [_m->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:indexCount

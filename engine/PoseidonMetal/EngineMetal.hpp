@@ -36,8 +36,11 @@ class EngineMetal : public Engine
     // s_psShadow). 70 vec4 (VSConstants) + 27 vec4 (PSConstants).
     float _vsShadow[70 * 4] = {};
     float _psShadow[27 * 4] = {};
+    float _cameraPos[3] = {}; // absolute camera position (world-matrix camera-relative shift)
+    float _curWorld[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // per-mesh world matrix (set in PrepareMeshTL)
     bool _sunEnabled = true;
     bool _frameConstantsBuilt = false;
+    render::LegacySpec _meshSpec = {};
 
   public:
     EngineMetal(int width, int height, bool windowed, int bpp);
