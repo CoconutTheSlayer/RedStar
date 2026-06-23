@@ -13,6 +13,11 @@ name = "poseidon_rust"
 #            harness needs to depend on the crate as a normal Rust library.
 crate-type = ["staticlib", "rlib"]
 
+[build-dependencies]
+# Generates include/poseidon_rust.h from the source at build time (see build.rs)
+# so the C header can never drift from the Rust signatures.
+cbindgen = "0.27"
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
