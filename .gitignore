@@ -76,3 +76,4 @@ target/
 !docs/**/*.png
 !tests/missions/screenshot/**/*.bmp
 !tests/missions/screenshot/**/*.png
+render-compare/

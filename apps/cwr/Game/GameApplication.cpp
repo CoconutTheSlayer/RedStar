@@ -1457,6 +1457,9 @@ void GameApplication::RegisterGraphicsBackends()
 {
     RegisterDummyGraphicsBackend();
     RegisterGL33GraphicsBackend();
+#if defined(__APPLE__)
+    RegisterMetalGraphicsBackend();
+#endif
 }
 
 bool GameApplication::InitializeInput()

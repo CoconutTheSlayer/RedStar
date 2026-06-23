@@ -63,6 +63,7 @@ elseif(APPLE)
     target_link_libraries(PoseidonGame PRIVATE
         GameBase
         PoseidonGL33
+        PoseidonMetal
         Poseidon
         PoseidonOpenAL
     )

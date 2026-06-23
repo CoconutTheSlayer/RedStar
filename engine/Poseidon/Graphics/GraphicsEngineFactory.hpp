@@ -110,6 +110,9 @@ class GraphicsEngineFactory
 
 void RegisterDummyGraphicsBackend();
 void RegisterGL33GraphicsBackend();
+#if defined(__APPLE__)
+void RegisterMetalGraphicsBackend();
+#endif
 
 } // namespace Poseidon
 #endif // POSEIDON_GRAPHICS_GRAPHICSENGINEFACTORY_HPP

@@ -20,7 +20,11 @@ typedef unsigned int dword;
 typedef unsigned char byte;
 
 #ifndef FALSE
-	typedef int BOOL;
+	// Under Objective-C (macOS Metal backend TUs) the system already provides
+	// `typedef bool BOOL;` via <objc/objc.h>; redefining it as int collides.
+	#ifndef __OBJC__
+		typedef int BOOL;
+	#endif
 	#define FALSE 0
 	#define TRUE 1
 #endif
