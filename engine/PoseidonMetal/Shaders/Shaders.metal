@@ -162,6 +162,26 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     return o;
 }
 
+// ---- Fullscreen blit (SSAA downscale: frameTex -> drawable) ----
+struct BlitOut
+{
+    float4 pos [[position]];
+    float2 uv;
+};
+vertex BlitOut vsBlit(uint vid [[vertex_id]])
+{
+    // Fullscreen triangle; uv (0,0) at the top-left to match the frame texture.
+    float2 uv = float2((vid << 1) & 2, vid & 2); // (0,0) (2,0) (0,2)
+    BlitOut o;
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+fragment float4 psBlit(BlitOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler s [[sampler(0)]])
+{
+    return tex.sample(s, in.uv);
+}
+
 // ---- Dark-polygon sun shadow (mirrors GL33 vsShadow/psShadow) ----
 // The engine projects each caster onto the ground and re-draws it as a flat,
 // unlit polygon whose colour is the black + shadowFactor-alpha shadow material

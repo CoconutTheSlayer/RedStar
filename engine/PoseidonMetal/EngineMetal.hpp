@@ -74,6 +74,10 @@ class EngineMetal : public Engine
     bool SetSwapInterval(int interval) override; // vsync on/off via CAMetalLayer.displaySyncEnabled
     int GetSwapInterval() const override;
     void SetMsaaSamples(int samples) override; // MSAA on the frame target (0/1 off, 2/4/8)
+    void SetAlphaToCoverage(bool enable) override; // grade cutout edges across MSAA samples
+    bool GetAlphaToCoverage() const override;
+    void SetRenderScale(float scale) override; // SSAA: render at scale x window, downscale on present
+    float GetRenderScale() const override;
     void ListResolutions(FindArray<ResolutionInfo>& ret) override;
     void ListRefreshRates(FindArray<int>& ret) override;
 

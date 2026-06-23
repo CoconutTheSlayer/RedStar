@@ -57,6 +57,12 @@ struct MetalState
     int sampleCount = 1;
     id<MTLTexture> msaaColor = nil;
     int msaaW = 0, msaaH = 0;
+    bool alphaToCoverage = false; // grade cutout (alpha-test) edges across MSAA samples
+
+    // SSAA: frameTex/msaaColor/depth are sized renderScale x the drawable; on
+    // present a fullscreen blit downsamples frameTex into the window-size drawable.
+    float renderScale = 1.0f;
+    id<MTLRenderPipelineState> psoBlit = nil; // fullscreen tex->drawable downscale
 
     // 2D TLVertexTable soup path (UI / options notebook): BeginMesh stashes the
     // current screen-space vertex array, PrepareTriangle the texture + per-draw
@@ -165,7 +171,7 @@ enum class MtlBlend
 
 static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib, const char* vsName,
                                           const char* psName, MTLPixelFormat colorFmt, MtlBlend blend,
-                                          MTLVertexDescriptor* vdesc, NSUInteger sampleCount)
+                                          MTLVertexDescriptor* vdesc, NSUInteger sampleCount, bool alphaToCoverage)
 {
     id<MTLFunction> vs = [lib newFunctionWithName:[NSString stringWithUTF8String:vsName]];
     id<MTLFunction> ps = [lib newFunctionWithName:[NSString stringWithUTF8String:psName]];
@@ -179,6 +185,7 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
     pd.fragmentFunction = ps;
     pd.vertexDescriptor = vdesc;
     pd.rasterSampleCount = sampleCount; // must match the (MSAA) render-pass attachments
+    pd.alphaToCoverageEnabled = (alphaToCoverage && sampleCount > 1); // grade cutout edges (MSAA only)
     pd.depthAttachmentPixelFormat = kDepthStencilFormat; // render pass carries depth+stencil
     pd.stencilAttachmentPixelFormat = kDepthStencilFormat;
     pd.colorAttachments[0].pixelFormat = colorFmt;
@@ -217,14 +224,15 @@ static void BuildPipelines(MetalState* m, int sampleCount)
 {
     const NSUInteger sc = (NSUInteger)(sampleCount < 1 ? 1 : sampleCount);
     const MTLPixelFormat cf = MTLPixelFormatBGRA8Unorm;
-    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc);
-    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc);
-    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
-    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::Alpha, MakeSVertexDescriptor(), sc);
-    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
-    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
+    const bool a2c = m->alphaToCoverage; // only effective on the opaque/cutout mesh PSOs + MSAA
+    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc, false);
+    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc, false);
+    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
+    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::Alpha, MakeSVertexDescriptor(), sc, false);
+    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
+    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, false);
     // Dark-polygon sun shadow: black + shadowFactor alpha, ZERO/1-srcA darken blend.
-    m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", cf, MtlBlend::Shadow, MakeSVertexDescriptor(), sc);
+    m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", cf, MtlBlend::Shadow, MakeSVertexDescriptor(), sc, a2c);
     m->sampleCount = (int)sc;
 }
 
@@ -250,6 +258,21 @@ static bool LoadShaders(MetalState* m)
     }
 
     BuildPipelines(m, m->sampleCount);
+
+    // SSAA downscale blit PSO: fullscreen triangle (no vertex buffer), samples
+    // frameTex into the single-sample, depth-less drawable.
+    {
+        id<MTLFunction> bvs = [m->lib newFunctionWithName:@"vsBlit"];
+        id<MTLFunction> bps = [m->lib newFunctionWithName:@"psBlit"];
+        MTLRenderPipelineDescriptor* bd = [[MTLRenderPipelineDescriptor alloc] init];
+        bd.vertexFunction = bvs;
+        bd.fragmentFunction = bps;
+        bd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        NSError* berr = nil;
+        m->psoBlit = [m->device newRenderPipelineStateWithDescriptor:bd error:&berr];
+        if (!m->psoBlit)
+            LOG_ERROR(Graphics, "Metal: blit PSO failed: {}", berr ? [[berr localizedDescription] UTF8String] : "?");
+    }
 
     for (int i = 0; i < 8; i++)
     {
@@ -592,14 +615,18 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
         _h = ph;
         _m->layer.drawableSize = CGSizeMake(pw, ph);
     }
-    EnsureFrameTex(_m, _w, _h);
-    if (!_m->depthTex || _m->depthW != _w || _m->depthH != _h ||
+    // SSAA: render targets are renderScale x the drawable; the scene renders at
+    // this size and is downsampled to the window on present.
+    const int rw = (int)lround((double)_m->renderScale * _w);
+    const int rh = (int)lround((double)_m->renderScale * _h);
+    EnsureFrameTex(_m, rw, rh);
+    if (!_m->depthTex || _m->depthW != rw || _m->depthH != rh ||
         (int)_m->depthTex.sampleCount != (_m->sampleCount < 1 ? 1 : _m->sampleCount))
     {
         const int sc = _m->sampleCount < 1 ? 1 : _m->sampleCount;
         MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthStencilFormat
-                                                                                     width:_w
-                                                                                    height:_h
+                                                                                     width:rw
+                                                                                    height:rh
                                                                                  mipmapped:NO];
         if (sc > 1)
         {
@@ -609,8 +636,8 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
         dd.usage = MTLTextureUsageRenderTarget;
         dd.storageMode = MTLStorageModePrivate;
         _m->depthTex = [_m->device newTextureWithDescriptor:dd];
-        _m->depthW = _w;
-        _m->depthH = _h;
+        _m->depthW = rw;
+        _m->depthH = rh;
     }
 
     const float r = ((color >> 16) & 0xFF) / 255.0f;
@@ -630,7 +657,7 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
 
     // Persistent per-frame render encoder; draw calls record into it until Present.
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
-    MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
+    MTLViewport vp = {0.0, 0.0, (double)_m->texW, (double)_m->texH, 0.0, 1.0};
     [_m->enc setViewport:vp];
 
     _frameConstantsBuilt = false; // rebuild 3D frame constants lazily this frame
@@ -667,7 +694,7 @@ void EngineMetal::Clear(bool clearZ, bool clearColor, PackedColor color)
                          clearZ ? MTLLoadActionClear : MTLLoadActionLoad, MTLClearColorMake(r, g, b, 1.0));
 
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
-    MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
+    MTLViewport vp = {0.0, 0.0, (double)_m->texW, (double)_m->texH, 0.0, 1.0};
     [_m->enc setViewport:vp];
 }
 
@@ -711,17 +738,37 @@ void EngineMetal::Present()
     id<CAMetalDrawable> drawable = [_m->layer nextDrawable];
     if (drawable)
     {
-        id<MTLBlitCommandEncoder> blit = [_m->cmd blitCommandEncoder];
-        [blit copyFromTexture:_m->frameTex
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(_m->texW, _m->texH, 1)
-                    toTexture:drawable.texture
-             destinationSlice:0
-             destinationLevel:0
-            destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
+        const bool sameSize = (_m->texW == (int)drawable.texture.width && _m->texH == (int)drawable.texture.height);
+        if (sameSize)
+        {
+            // 1:1 — a plain blit copy (no SSAA downscale needed).
+            id<MTLBlitCommandEncoder> blit = [_m->cmd blitCommandEncoder];
+            [blit copyFromTexture:_m->frameTex
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(_m->texW, _m->texH, 1)
+                        toTexture:drawable.texture
+                 destinationSlice:0
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
+        else if (_m->psoBlit)
+        {
+            // SSAA: fullscreen draw samples the larger frameTex (linear) into the
+            // window-size drawable, averaging the supersampled pixels down.
+            MTLRenderPassDescriptor* brp = [MTLRenderPassDescriptor renderPassDescriptor];
+            brp.colorAttachments[0].texture = drawable.texture;
+            brp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            brp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> be = [_m->cmd renderCommandEncoderWithDescriptor:brp];
+            [be setRenderPipelineState:_m->psoBlit];
+            [be setFragmentTexture:_m->frameTex atIndex:0];
+            [be setFragmentSamplerState:_m->samplers[SamplerIdx(true, true, false)] atIndex:0]; // clamp+linear
+            [be drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [be endEncoding];
+        }
         [_m->cmd presentDrawable:drawable];
     }
 
@@ -897,6 +944,41 @@ void EngineMetal::SetMsaaSamples(int samples)
     _m->depthTex = nil;
     _m->depthW = _m->depthH = 0;
     LOG_INFO(Graphics, "Metal: MSAA {}x", s);
+}
+
+void EngineMetal::SetRenderScale(float scale)
+{
+    if (!_m)
+        return;
+    float s = scale < 0.5f ? 0.5f : (scale > 2.0f ? 2.0f : scale);
+    if (s == _m->renderScale)
+        return;
+    _m->renderScale = s;
+    _m->frameTex = nil; // recreate render targets at the new size next InitDraw
+    _m->texW = _m->texH = 0;
+    _m->msaaColor = nil;
+    _m->msaaW = _m->msaaH = 0;
+    _m->depthTex = nil;
+    _m->depthW = _m->depthH = 0;
+    LOG_INFO(Graphics, "Metal: render scale {}", s);
+}
+
+float EngineMetal::GetRenderScale() const
+{
+    return _m ? _m->renderScale : 1.0f;
+}
+
+void EngineMetal::SetAlphaToCoverage(bool enable)
+{
+    if (!_m || _m->alphaToCoverage == enable)
+        return;
+    _m->alphaToCoverage = enable;
+    BuildPipelines(_m, _m->sampleCount); // A2C is a PSO property -> rebuild
+}
+
+bool EngineMetal::GetAlphaToCoverage() const
+{
+    return _m && _m->alphaToCoverage;
 }
 
 void EngineMetal::ListResolutions(FindArray<ResolutionInfo>& /*ret*/) {}
