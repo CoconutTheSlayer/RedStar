@@ -73,6 +73,7 @@ class EngineMetal : public Engine
     bool SwitchRefreshRate(int refresh) override { return true; }
     bool SetSwapInterval(int interval) override; // vsync on/off via CAMetalLayer.displaySyncEnabled
     int GetSwapInterval() const override;
+    void SetMsaaSamples(int samples) override; // MSAA on the frame target (0/1 off, 2/4/8)
     void ListResolutions(FindArray<ResolutionInfo>& ret) override;
     void ListRefreshRates(FindArray<int>& ret) override;
 

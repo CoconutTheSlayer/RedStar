@@ -52,6 +52,12 @@ struct MetalState
     int texW = 0;
     int texH = 0;
 
+    // MSAA: when sampleCount>1, the scene renders into msaaColor (+ a multisample
+    // depth/stencil) and resolves into the single-sample frameTex on store.
+    int sampleCount = 1;
+    id<MTLTexture> msaaColor = nil;
+    int msaaW = 0, msaaH = 0;
+
     // 2D TLVertexTable soup path (UI / options notebook): BeginMesh stashes the
     // current screen-space vertex array, PrepareTriangle the texture + per-draw
     // depth/sampler state (so depth-tested 3D content like terrain submitted
@@ -159,7 +165,7 @@ enum class MtlBlend
 
 static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib, const char* vsName,
                                           const char* psName, MTLPixelFormat colorFmt, MtlBlend blend,
-                                          MTLVertexDescriptor* vdesc)
+                                          MTLVertexDescriptor* vdesc, NSUInteger sampleCount)
 {
     id<MTLFunction> vs = [lib newFunctionWithName:[NSString stringWithUTF8String:vsName]];
     id<MTLFunction> ps = [lib newFunctionWithName:[NSString stringWithUTF8String:psName]];
@@ -172,6 +178,7 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
     pd.vertexFunction = vs;
     pd.fragmentFunction = ps;
     pd.vertexDescriptor = vdesc;
+    pd.rasterSampleCount = sampleCount; // must match the (MSAA) render-pass attachments
     pd.depthAttachmentPixelFormat = kDepthStencilFormat; // render pass carries depth+stencil
     pd.stencilAttachmentPixelFormat = kDepthStencilFormat;
     pd.colorAttachments[0].pixelFormat = colorFmt;
@@ -203,6 +210,24 @@ static id<MTLRenderPipelineState> MakePSO(id<MTLDevice> dev, id<MTLLibrary> lib,
     return pso;
 }
 
+// (Re)build every render pipeline state for the given MSAA sample count.  The
+// rasterSampleCount must match the render-pass attachments, so changing MSAA
+// rebuilds all PSOs.
+static void BuildPipelines(MetalState* m, int sampleCount)
+{
+    const NSUInteger sc = (NSUInteger)(sampleCount < 1 ? 1 : sampleCount);
+    const MTLPixelFormat cf = MTLPixelFormatBGRA8Unorm;
+    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc);
+    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc);
+    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
+    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::Alpha, MakeSVertexDescriptor(), sc);
+    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
+    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", cf, MtlBlend::None, MakeSVertexDescriptor(), sc);
+    // Dark-polygon sun shadow: black + shadowFactor alpha, ZERO/1-srcA darken blend.
+    m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", cf, MtlBlend::Shadow, MakeSVertexDescriptor(), sc);
+    m->sampleCount = (int)sc;
+}
+
 static bool LoadShaders(MetalState* m)
 {
     NSError* err = nil;
@@ -224,16 +249,7 @@ static bool LoadShaders(MetalState* m)
         return false;
     }
 
-    MTLVertexDescriptor* tlDesc = MakeTLVertexDescriptor();
-    MTLVertexDescriptor* svDesc = MakeSVertexDescriptor();
-    m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, tlDesc);
-    m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, MakeTLVertexDescriptor());
-    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::None, svDesc);
-    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", MTLPixelFormatBGRA8Unorm, MtlBlend::Alpha, MakeSVertexDescriptor());
-    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", MTLPixelFormatBGRA8Unorm, MtlBlend::None, MakeSVertexDescriptor());
-    m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", MTLPixelFormatBGRA8Unorm, MtlBlend::None, MakeSVertexDescriptor());
-    // Dark-polygon sun shadow: black + shadowFactor alpha, ZERO/1-srcA darken blend.
-    m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", MTLPixelFormatBGRA8Unorm, MtlBlend::Shadow, MakeSVertexDescriptor());
+    BuildPipelines(m, m->sampleCount);
 
     for (int i = 0; i < 8; i++)
     {
@@ -491,18 +507,74 @@ void EngineMetal::DestroyMetal()
 
 static void EnsureFrameTex(MetalState* m, int w, int h)
 {
-    if (m->frameTex && m->texW == w && m->texH == h)
-        return;
-    MTLTextureDescriptor* d =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                           width:w
-                                                          height:h
-                                                       mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    d.storageMode = MTLStorageModeShared; // unified memory: CPU-readable for screenshots
-    m->frameTex = [m->device newTextureWithDescriptor:d];
-    m->texW = w;
-    m->texH = h;
+    if (!m->frameTex || m->texW != w || m->texH != h)
+    {
+        MTLTextureDescriptor* d =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:w
+                                                              height:h
+                                                           mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared; // unified memory: CPU-readable for screenshots
+        m->frameTex = [m->device newTextureWithDescriptor:d];
+        m->texW = w;
+        m->texH = h;
+        m->msaaColor = nil; // size changed -> rebuild the MSAA target too
+        m->msaaW = m->msaaH = 0;
+    }
+
+    // Multisample colour target (resolves into frameTex on store).
+    if (m->sampleCount > 1 && (!m->msaaColor || m->msaaW != w || m->msaaH != h))
+    {
+        MTLTextureDescriptor* md =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:w
+                                                              height:h
+                                                           mipmapped:NO];
+        md.textureType = MTLTextureType2DMultisample;
+        md.sampleCount = m->sampleCount;
+        md.usage = MTLTextureUsageRenderTarget;
+        md.storageMode = MTLStorageModePrivate;
+        m->msaaColor = [m->device newTextureWithDescriptor:md];
+        m->msaaW = w;
+        m->msaaH = h;
+    }
+    else if (m->sampleCount <= 1)
+    {
+        m->msaaColor = nil;
+    }
+}
+
+// Configure a render pass's colour/depth/stencil attachments, MSAA-aware.  When
+// multisampling, the scene renders into msaaColor and resolves into frameTex on
+// store (StoreAndMultisampleResolve keeps the samples so a mid-frame Clear() pass
+// can Load and continue while frameTex stays resolved for present/screenshots).
+static void SetupPassAttachments(MTLRenderPassDescriptor* rp, MetalState* m, MTLLoadAction colorLoad,
+                                 MTLLoadAction depthStencilLoad, MTLClearColor clearColor)
+{
+    const bool msaa = (m->sampleCount > 1 && m->msaaColor != nil);
+    if (msaa)
+    {
+        rp.colorAttachments[0].texture = m->msaaColor;
+        rp.colorAttachments[0].resolveTexture = m->frameTex;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    }
+    else
+    {
+        rp.colorAttachments[0].texture = m->frameTex;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    rp.colorAttachments[0].loadAction = colorLoad;
+    rp.colorAttachments[0].clearColor = clearColor;
+
+    rp.depthAttachment.texture = m->depthTex;
+    rp.depthAttachment.loadAction = depthStencilLoad;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = 1.0;
+    rp.stencilAttachment.texture = m->depthTex;
+    rp.stencilAttachment.loadAction = depthStencilLoad;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.clearStencil = 0;
 }
 
 void EngineMetal::InitDraw(bool clear, PackedColor color)
@@ -521,12 +593,19 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
         _m->layer.drawableSize = CGSizeMake(pw, ph);
     }
     EnsureFrameTex(_m, _w, _h);
-    if (!_m->depthTex || _m->depthW != _w || _m->depthH != _h)
+    if (!_m->depthTex || _m->depthW != _w || _m->depthH != _h ||
+        (int)_m->depthTex.sampleCount != (_m->sampleCount < 1 ? 1 : _m->sampleCount))
     {
+        const int sc = _m->sampleCount < 1 ? 1 : _m->sampleCount;
         MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthStencilFormat
                                                                                      width:_w
                                                                                     height:_h
                                                                                  mipmapped:NO];
+        if (sc > 1)
+        {
+            dd.textureType = MTLTextureType2DMultisample;
+            dd.sampleCount = sc;
+        }
         dd.usage = MTLTextureUsageRenderTarget;
         dd.storageMode = MTLStorageModePrivate;
         _m->depthTex = [_m->device newTextureWithDescriptor:dd];
@@ -546,18 +625,8 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     _m->cmd = [_m->queue commandBuffer];
 
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = _m->frameTex;
-    rp.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
-    rp.depthAttachment.texture = _m->depthTex;
-    rp.depthAttachment.loadAction = MTLLoadActionClear;
-    rp.depthAttachment.storeAction = MTLStoreActionStore; // preserved across mid-frame Clear() pass restarts
-    rp.depthAttachment.clearDepth = 1.0;                  // Metal NDC depth [0,1], far = 1
-    rp.stencilAttachment.texture = _m->depthTex;          // shared depth+stencil texture
-    rp.stencilAttachment.loadAction = MTLLoadActionClear; // shadow overlap mask starts at 0
-    rp.stencilAttachment.storeAction = MTLStoreActionStore;
-    rp.stencilAttachment.clearStencil = 0;
+    SetupPassAttachments(rp, _m, clear ? MTLLoadActionClear : MTLLoadActionLoad, MTLLoadActionClear,
+                         MTLClearColorMake(r, g, b, 1.0));
 
     // Persistent per-frame render encoder; draw calls record into it until Present.
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
@@ -590,25 +659,12 @@ void EngineMetal::Clear(bool clearZ, bool clearColor, PackedColor color)
         _m->enc = nil;
     }
 
+    const float r = ((color >> 16) & 0xFF) / 255.0f;
+    const float g = ((color >> 8) & 0xFF) / 255.0f;
+    const float b = (color & 0xFF) / 255.0f;
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = _m->frameTex;
-    rp.colorAttachments[0].loadAction = clearColor ? MTLLoadActionClear : MTLLoadActionLoad;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    if (clearColor)
-    {
-        const float r = ((color >> 16) & 0xFF) / 255.0f;
-        const float g = ((color >> 8) & 0xFF) / 255.0f;
-        const float b = (color & 0xFF) / 255.0f;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
-    }
-    rp.depthAttachment.texture = _m->depthTex;
-    rp.depthAttachment.loadAction = clearZ ? MTLLoadActionClear : MTLLoadActionLoad;
-    rp.depthAttachment.storeAction = MTLStoreActionStore;
-    rp.depthAttachment.clearDepth = 1.0;
-    rp.stencilAttachment.texture = _m->depthTex;
-    rp.stencilAttachment.loadAction = clearZ ? MTLLoadActionClear : MTLLoadActionLoad; // clear mask with depth
-    rp.stencilAttachment.storeAction = MTLStoreActionStore;
-    rp.stencilAttachment.clearStencil = 0;
+    SetupPassAttachments(rp, _m, clearColor ? MTLLoadActionClear : MTLLoadActionLoad,
+                         clearZ ? MTLLoadActionClear : MTLLoadActionLoad, MTLClearColorMake(r, g, b, 1.0));
 
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
     MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
@@ -820,6 +876,27 @@ bool EngineMetal::SetSwapInterval(int interval)
 int EngineMetal::GetSwapInterval() const
 {
     return (_m && _m->layer && !_m->layer.displaySyncEnabled) ? 0 : 1;
+}
+
+void EngineMetal::SetMsaaSamples(int samples)
+{
+    if (!_m || !_m->device)
+        return;
+    int s = (samples < 2) ? 1 : samples;
+    // Clamp down to a device-supported count (Apple GPUs support 4; 8 on some).
+    while (s > 1 && ![_m->device supportsTextureSampleCount:(NSUInteger)s])
+        s = (s == 8) ? 4 : (s == 4 ? 2 : 1);
+    if (s == _m->sampleCount)
+        return;
+    _m->sampleCount = s;
+    BuildPipelines(_m, s);          // rasterSampleCount must match the new attachments
+    _m->frameTex = nil;             // recreate frame/MSAA/depth targets at the new count
+    _m->texW = _m->texH = 0;
+    _m->msaaColor = nil;
+    _m->msaaW = _m->msaaH = 0;
+    _m->depthTex = nil;
+    _m->depthW = _m->depthH = 0;
+    LOG_INFO(Graphics, "Metal: MSAA {}x", s);
 }
 
 void EngineMetal::ListResolutions(FindArray<ResolutionInfo>& /*ret*/) {}
