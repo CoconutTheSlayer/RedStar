@@ -171,6 +171,11 @@ if(POSEIDON_ENABLE_LTO AND NOT POSEIDON_BUILD_FUZZERS AND NOT CMAKE_CXX_FLAGS MA
     endif()
 endif()
 
+# Rust toolchain spike: build the PoseidonRust staticlib (via Corrosion/Cargo)
+# and the RustSpike executable that calls it. Requires cargo on PATH and network
+# on first configure (to fetch Corrosion). See engine/PoseidonRust/README.md.
+option(POSEIDON_ENABLE_RUST "Build the Rust FFI toolchain spike (Corrosion + RustSpike)" ON)
+
 configure_file(
     ${CMAKE_SOURCE_DIR}/cmake/BuildConfig.h.in
     ${CMAKE_BINARY_DIR}/generated/BuildConfig.h
@@ -229,6 +234,12 @@ add_subdirectory(apps/tools/Studio)
 # License-restricted UI test sources are not part of this public tree.
 add_subdirectory(apps/tetris/Tetris)
 add_subdirectory(tests/unit/apps/Tetris)
+
+# Rust FFI toolchain spike (Corrosion-imported staticlib + RustSpike consumer).
+if(POSEIDON_ENABLE_RUST)
+    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonRust.cmake)
+    add_subdirectory(apps/spikes/RustSpike)
+endif()
 
 include(${CMAKE_SOURCE_DIR}/cmake/TridentCTest.cmake)
 register_trident_integration_ctests()
