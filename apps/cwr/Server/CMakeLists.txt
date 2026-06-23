@@ -48,6 +48,13 @@ if(WIN32)
         ws2_32.lib
         legacy_stdio_definitions.lib
     )
+elseif(APPLE)
+    # ld64 resolves circular static-archive references in a single multi-pass
+    # link; it has no --start-group/--end-group (and doesn't need them).
+    target_link_libraries(PoseidonServer PRIVATE
+        GameBase
+        Poseidon
+    )
 else()
     target_link_libraries(PoseidonServer PRIVATE
         -Wl,--start-group

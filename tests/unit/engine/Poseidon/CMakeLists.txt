@@ -539,6 +539,11 @@ if(WIN32)
         comctl32    # Common controls
         legacy_stdio_definitions.lib  # Legacy CRT functions (swprintf, etc.)
     )
+elseif(APPLE)
+    # ld64 resolves circular static-archive references itself; no --start-group.
+    target_link_libraries(PoseidonTests PRIVATE
+        PoseidonGL33 PoseidonMetal Poseidon PoseidonOpenAL
+    )
 else()
     target_link_libraries(PoseidonTests PRIVATE
         -Wl,--start-group

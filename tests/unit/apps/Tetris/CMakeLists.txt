@@ -33,6 +33,9 @@ if(WIN32)
         ws2_32 winmm version comctl32 ole32 shell32
         legacy_stdio_definitions.lib
     )
+elseif(APPLE)
+    # GameBase::RegisterGraphicsBackends references the Metal backend on Apple.
+    target_link_libraries(PoseidonTetrisTests PRIVATE PoseidonMetal)
 endif()
 
 target_include_directories(PoseidonTetrisTests PRIVATE
