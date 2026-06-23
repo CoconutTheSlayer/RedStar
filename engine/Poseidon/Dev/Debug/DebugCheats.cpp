@@ -548,6 +548,7 @@ void Invoke(std::string_view /*args*/, std::string& out)
 #include <Poseidon/World/Scene/Scene.hpp>
 #include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
 #include <SDL3/SDL_clipboard.h>
 
 namespace Poseidon::Dev
@@ -619,6 +620,87 @@ void Invoke(std::string_view /*args*/, std::string& out)
 }
 
 } // namespace Cmd_StorePosition
+
+// Cmd_SpawnLight — drop a point light on the player so you can see the
+// per-pixel local-light falloff sweep across nearby surfaces as you move.
+// Implemented as a LightPointOnVehicle attached to the player (the same
+// class a campfire / vehicle headlight uses), so it follows you with no
+// per-frame bookkeeping.  Local lights are night-gated by the engine, so
+// this only lights anything after dusk — spawn it in a night mission.
+//
+// Usage:  light            toggle on/off (default ~6 m falloff radius)
+//         light <metres>   (re)create at that falloff radius, on
+namespace Cmd_SpawnLight
+{
+namespace
+{
+// Owning ref keeps the light alive; the Scene stores only a weak Link.
+Ref<LightPointOnVehicle> s_light;
+} // namespace
+
+bool Available()
+{
+    return GScene != nullptr && GWorld != nullptr && GWorld->GetRealPlayer() != nullptr;
+}
+
+void Invoke(std::string_view args, std::string& out)
+{
+    if (!Available())
+    {
+        out = "light: no scene / player";
+        return;
+    }
+    Person* player = GWorld->GetRealPlayer();
+
+    // Optional falloff radius in metres (full intensity inside it, quadratic
+    // falloff beyond).  SetBrightness maps coef -> 50*coef metres.
+    float radius = 6.0f;
+    if (!args.empty())
+    {
+        char tmp[32];
+        size_t n = args.size();
+        if (n >= sizeof(tmp))
+        {
+            out = "light: argument too long";
+            return;
+        }
+        std::memcpy(tmp, args.data(), n);
+        tmp[n] = 0;
+        float v = 0.0f;
+        if (sscanf(tmp, "%f", &v) != 1 || v < 0.5f)
+        {
+            out = "light: expected <metres> (>= 0.5), got: " + std::string(args);
+            return;
+        }
+        radius = v;
+    }
+
+    // (Re)create when we have no light, the player respawned (the Link nulled
+    // and the player reparented), or an explicit radius was passed.
+    if (!s_light || s_light->AttachedOn() != player || !args.empty())
+    {
+        // ~1.5 m above the player origin, slightly forward — a carried torch.
+        s_light = new LightPointOnVehicle(player, Vector3(0, 1.5f, 0.4f));
+        s_light->SetDiffuse(Color(1.0f, 0.85f, 0.6f)); // warm white
+        s_light->SetAmbient(Color(0.04f, 0.04f, 0.05f));
+        s_light->SetBrightness(radius / 50.0f);
+        s_light->Switch(true);
+        GScene->AddLight(s_light);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "light: ON (torch on player, %.1f m radius)", radius);
+        out = buf;
+        LOG_INFO(Mission, "DebugCheats::SpawnLight -> {}", out);
+        return;
+    }
+
+    // Bare command toggles the existing light.
+    bool on = !s_light->IsOn();
+    s_light->Switch(on);
+    out = on ? "light: ON" : "light: OFF";
+    LOG_INFO(Mission, "DebugCheats::SpawnLight -> {}", out);
+}
+
+} // namespace Cmd_SpawnLight
 
 // Cmd_LoadGame — inverse of Cmd_SaveGame.  Calls World::LoadBin which
 // rehydrates the world from <SaveDir>/save.fps in place.  The path is
@@ -746,6 +828,9 @@ struct RegisterAll
         DebugCommands::Register({"storepos", "Log camera/player position + copy to clipboard.",
                                  Cmd_StorePosition::Available, [](std::string_view args, std::string& out)
                                  { Cmd_StorePosition::Invoke(args, out); }});
+        DebugCommands::Register({"light", "Spawn/toggle a point light on the player (light [metres]); night only.",
+                                 Cmd_SpawnLight::Available, [](std::string_view args, std::string& out)
+                                 { Cmd_SpawnLight::Invoke(args, out); }});
         DebugCommands::Register({"save", "Save current game state to <SaveDir>/save.fps.", Cmd_SaveGame::Available,
                                  [](std::string_view args, std::string& out) { Cmd_SaveGame::Invoke(args, out); }});
         DebugCommands::Register({"load", "Load game state from <SaveDir>/save.fps.", Cmd_LoadGame::Available,
