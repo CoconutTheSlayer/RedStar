@@ -1158,11 +1158,11 @@ void EngineMetal::PrepareTriangle(const MipInfo& mip, int specFlags)
     const render::LegacySpec spec = render::SplitLegacy((unsigned)specFlags);
     const bool noZBuf = render::Has(spec.backend, render::Backend::NoZBuf);
     const bool noZWrite = render::Has(spec.backend, render::Backend::NoZWrite);
-    // In the interface phase every soup draw is an overlay (the options notebook
-    // is a 3D model whose spec lacks NoZBuf) — force no depth test so the
-    // first-person weapon can't poke through it.
-    _m->soupDepth =
-        (_in2DPhase || noZBuf) ? _m->dss2D : (noZWrite ? _m->dss3DNoWrite : _m->dss3D);
+    // Honour the spec's depth mode.  Interface 3D models (the campaign book, the
+    // options notebook) need real depth so their own pages self-occlude; they
+    // overlay the 3D scene because the UI container clears depth first (Clear()),
+    // not by disabling depth here.
+    _m->soupDepth = noZBuf ? _m->dss2D : (noZWrite ? _m->dss3DNoWrite : _m->dss3D);
 
     const bool clampU = render::Has(spec.backend, render::Backend::ClampU);
     const bool clampV = render::Has(spec.backend, render::Backend::ClampV);
