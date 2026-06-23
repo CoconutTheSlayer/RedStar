@@ -120,21 +120,40 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     litColor.rgb = emissive.rgb + ambient.rgb * sunEn + diffuse.rgb * NdotL * sunEn;
     litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
 
+    // Local point/spot lights (lamps, headlights), per-vertex (mirrors GL33).
+    // Quadratic falloff past startAtten, cut off at 100x; spotlights gate by a
+    // cone factor (full inside cos 8deg, zero outside cos 12deg).
+    const float MIN_INSIDE2 = 0.95677279; // (cos 12deg)^2
+    const float MAX_INSIDE2 = 0.98063081; // (cos 8deg)^2
     int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
     for (int i = 0; i < nLights; i++)
     {
         float4 lp = vc.reg[VS_LIGHTPOS + i];
+        float4 ldir = vc.reg[VS_LIGHTDIR + i];
         float3 toLight = lp.xyz - worldPos.xyz;
         float size2 = dot(toLight, toLight);
         float startAtten2 = lp.w * lp.w;
         if (size2 >= startAtten2 * 100.0)
             continue;
+
+        float cone = 1.0;
+        if (ldir.w > 0.5) // spotlight
+        {
+            float inside = -dot(toLight, ldir.xyz);
+            if (inside <= 0.0)
+                continue;
+            float cos2 = (inside * inside) / size2;
+            if (cos2 < MIN_INSIDE2)
+                continue;
+            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
+        }
+
         float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
         float cosFi = dot(toLight, worldNormal);
         float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
         float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
         if (cosFi > 0.0)
-            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * atten;
+            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone);
         else
             litColor.rgb += la * atten;
     }

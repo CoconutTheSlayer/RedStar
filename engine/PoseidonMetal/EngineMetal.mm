@@ -60,7 +60,12 @@ enum
     TexMat1 = 28,
     TexCtrl = 32,
     LightCount = 33,
+    LightPos = 34,     // [MaxLocalLights] xyz camera-relative pos, w = startAtten
+    LightDiffuse = 42, // [MaxLocalLights] rgb diffuse * mat * nightEffect
+    LightAmbient = 50, // [MaxLocalLights] rgb ambient * mat * nightEffect
+    LightDir = 58,     // [MaxLocalLights] xyz beam dir, w = isSpot
 };
+constexpr int MaxLocalLights = 8;
 } // namespace VSlot
 namespace PSlot
 {
@@ -1418,7 +1423,7 @@ void EngineMetal::EnableSunLight(bool enable)
     memcpy(_vsShadow + VSlot::SunEn * 4, se, 16);
 }
 
-void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/, const render::LegacySpec& /*spec*/)
+void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& lights, const render::LegacySpec& /*spec*/)
 {
     auto wr = [&](int slot, const Color& c) {
         float v[4] = {c.R(), c.G(), c.B(), c.A()};
@@ -1442,8 +1447,64 @@ void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& /*lights*/
     memcpy(_vsShadow + VSlot::Spec * 4, spec, 16);
     float specEn[4] = {mat.specularPower > 0 ? 1.0f : 0.0f, 0, 0, 0};
     memcpy(_vsShadow + VSlot::SpecEn * 4, specEn, 16);
-    float lc[4] = {0, 0, 0, 0};
-    memcpy(_vsShadow + VSlot::LightCount * 4, lc, 16); // 0 — local lights deferred
+
+    UploadLocalLights(lights, mat, sun ? sun->NightEffect() : 0.0f);
+}
+
+// Per-vertex point/spot lights (lamps, headlights), gated by NightEffect and
+// camera-relative to match the shaders' camera-relative world space.  Mirrors
+// EngineGL33::UploadVSLights.
+void EngineMetal::UploadLocalLights(const LightList& lights, const TLMaterial& mat, float nightEffect)
+{
+    int n = 0;
+    if (nightEffect > 0.0f)
+    {
+        const Color matDif = mat.diffuse * nightEffect;
+        const Color matAmb = mat.ambient * nightEffect;
+        for (int i = 0; i < lights.Size() && n < VSlot::MaxLocalLights; i++)
+        {
+            Light* light = lights[i];
+            if (!light)
+                continue;
+            LightDescription desc;
+            light->GetDescription(desc);
+            const bool isSpot = desc.type == LTSpotLight;
+            if (desc.type != LTPoint && !isSpot)
+                continue; // point + spot only; the sun is the directional term
+
+            float* p = _vsShadow + (VSlot::LightPos + n) * 4;
+            p[0] = desc.pos.X() - _cameraPos[0];
+            p[1] = desc.pos.Y() - _cameraPos[1];
+            p[2] = desc.pos.Z() - _cameraPos[2];
+            p[3] = desc.startAtten;
+
+            Vector3 beam = desc.dir;
+            beam.Normalize();
+            float* dir = _vsShadow + (VSlot::LightDir + n) * 4;
+            dir[0] = beam.X();
+            dir[1] = beam.Y();
+            dir[2] = beam.Z();
+            dir[3] = isSpot ? 1.0f : 0.0f;
+
+            const Color ld = desc.diffuse * matDif;
+            float* df = _vsShadow + (VSlot::LightDiffuse + n) * 4;
+            df[0] = ld.R();
+            df[1] = ld.G();
+            df[2] = ld.B();
+            df[3] = 0.0f;
+
+            const Color la = desc.ambient * matAmb;
+            float* am = _vsShadow + (VSlot::LightAmbient + n) * 4;
+            am[0] = la.R();
+            am[1] = la.G();
+            am[2] = la.B();
+            am[3] = 0.0f;
+
+            n++;
+        }
+    }
+    float lc[4] = {(float)n, 0, 0, 0};
+    memcpy(_vsShadow + VSlot::LightCount * 4, lc, 16);
 }
 
 void EngineMetal::FogColorChanged(const Color& c)

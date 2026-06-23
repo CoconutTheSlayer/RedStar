@@ -154,6 +154,7 @@ class EngineMetal : public Engine
     void CaptureScreenshotIfPending();
     void BuildFrameConstants();
     void ApplyDetailTexgen(bool detail); // set VS texCtrl/texMat1 for the detail UV scale
+    void UploadLocalLights(const LightList& lights, const TLMaterial& mat, float nightEffect);
 };
 
 } // namespace Poseidon
