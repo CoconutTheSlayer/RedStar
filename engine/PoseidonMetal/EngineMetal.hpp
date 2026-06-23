@@ -30,6 +30,8 @@ class EngineMetal : public Engine
     int _pixelSize = 32;
     bool _windowed = true;
     bool _frameOpen = false;
+    bool _focused = true;    // window focus — relative-mouse grab only applies while focused
+    bool _mouseGrab = true;  // desired grab state (gameplay grabs, menus release)
     RString _pendingScreenshotPath;
 
     // CPU shadows of the VS/PS uniform blocks (mirror EngineGL33's s_vsShadow /
@@ -40,6 +42,11 @@ class EngineMetal : public Engine
     float _curWorld[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; // per-mesh world matrix (set in PrepareMeshTL)
     bool _sunEnabled = true;
     bool _frameConstantsBuilt = false;
+    // True once the per-frame 2D interface phase has started (first immediate-2D
+    // draw).  In that phase, soup draws (the options notebook etc.) must ignore
+    // depth so they overlay the 3D scene instead of being occluded by close
+    // geometry like the first-person weapon.
+    bool _in2DPhase = false;
     render::LegacySpec _meshSpec = {};
 
   public:
@@ -64,6 +71,8 @@ class EngineMetal : public Engine
     bool SetWindowMode(WindowMode mode) override { return true; }
     bool SwitchRes(int w, int h, int bpp) override;
     bool SwitchRefreshRate(int refresh) override { return true; }
+    bool SetSwapInterval(int interval) override; // vsync on/off via CAMetalLayer.displaySyncEnabled
+    int GetSwapInterval() const override;
     void ListResolutions(FindArray<ResolutionInfo>& ret) override;
     void ListRefreshRates(FindArray<int>& ret) override;
 
@@ -118,13 +127,17 @@ class EngineMetal : public Engine
     void EndMeshTL(const Shape& sMesh) override;
     void DrawSectionTL(const Shape& sMesh, int beg, int end) override;
 
-    // --- Geometry / 2D submission: no-op stubs ---
-    void PrepareMesh(const render::LegacySpec&) override {}
-    void BeginMesh(TLVertexTable&, const render::LegacySpec&) override {}
-    void EndMesh(TLVertexTable&) override {}
-    void PrepareTriangle(const MipInfo&, int) override {}
-    void DrawPolygon(const VertexIndex*, int) override {}
-    void DrawSection(const FaceArray&, Offset, Offset) override {}
+    // --- 2D TLVertexTable soup path ---
+    // The UI (in-game options notebook, list/control backgrounds) and some 2D
+    // effects render through here: BeginMesh hands us a screen-space TLVertex
+    // array, PrepareTriangle sets the texture, and DrawPolygon/DrawSection draw
+    // indexed triangle fans into it.  Implemented in EngineMetal.mm.
+    void PrepareMesh(const render::LegacySpec&) override {} // single render pass: nothing to set up
+    void BeginMesh(TLVertexTable&, const render::LegacySpec&) override;
+    void EndMesh(TLVertexTable&) override;
+    void PrepareTriangle(const MipInfo&, int) override;
+    void DrawPolygon(const VertexIndex*, int) override;
+    void DrawSection(const FaceArray&, Offset, Offset) override;
     void DrawDecal(Vector3Par, float, float, float, PackedColor, const MipInfo&, int) override {}
     using Engine::Draw2D; // unhide base overloads
     void Draw2D(const Draw2DPars&, const Rect2DAbs&, const Rect2DAbs&) override;

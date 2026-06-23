@@ -6,6 +6,7 @@
 #include <Poseidon/Graphics/Core/TLVertex.hpp>
 #include <Poseidon/Graphics/Core/MatrixConversion.hpp>
 #include <Poseidon/Graphics/Rendering/Primitives/Vertex.hpp>
+#include <Poseidon/Graphics/Rendering/Primitives/Poly.hpp>
 #include <Poseidon/Graphics/Rendering/Lighting/Lights.hpp>
 #include <Poseidon/Graphics/Rendering/RenderFlags.hpp>
 #include <Poseidon/Graphics/Rendering/BuildRenderPassDescriptor.hpp>
@@ -50,6 +51,16 @@ struct MetalState
     id<MTLRenderCommandEncoder> enc = nil; // persistent per-frame render encoder
     int texW = 0;
     int texH = 0;
+
+    // 2D TLVertexTable soup path (UI / options notebook): BeginMesh stashes the
+    // current screen-space vertex array, PrepareTriangle the texture + per-draw
+    // depth/sampler state (so depth-tested 3D content like terrain submitted
+    // through this path doesn't overdraw as flat no-depth quads).
+    const Poseidon::TLVertex* soupVerts = nullptr;
+    int soupCount = 0;
+    id<MTLTexture> soupTex = nil;
+    id<MTLDepthStencilState> soupDepth = nil; // set per PrepareTriangle from the spec
+    id<MTLSamplerState> soupSampler = nil;
 
     // Shaders / pipeline (M2 spine)
     id<MTLLibrary> lib = nil;
@@ -258,7 +269,8 @@ static inline int SamplerIdx(bool clampU, bool clampV, bool point)
 }
 
 static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MTLRenderPipelineState> pso,
-                        id<MTLTexture> tex, int w, int h)
+                        id<MTLTexture> tex, int w, int h, id<MTLDepthStencilState> depthState,
+                        id<MTLSamplerState> sampler)
 {
     if (!m->enc || !pso || n < 3 || !m->curRing)
         return;
@@ -284,15 +296,14 @@ static void EmitPolyFan(MetalState* m, const Poseidon::TLVertex* v, int n, id<MT
     vsConst[21 * 4 + 1] = 2.0f / h;
 
     [m->enc setRenderPipelineState:pso];
-    [m->enc setDepthStencilState:m->dss2D]; // 2D: no depth test/write
+    [m->enc setDepthStencilState:depthState];
+    [m->enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f]; // clear any 3D OnSurface bias
     [m->enc setVertexBuffer:m->curRing offset:m->ringUsed atIndex:0];
     [m->enc setVertexBytes:vsConst length:sizeof(vsConst) atIndex:1];
     if (tex)
     {
         [m->enc setFragmentTexture:tex atIndex:0];
-        // 2D UI clamps both axes (mirrors GL33 forcing ClampU|ClampV) so panel
-        // backgrounds stretch their edge texel instead of tiling across the rect.
-        [m->enc setFragmentSamplerState:m->samplers[SamplerIdx(true, true, false)] atIndex:0];
+        [m->enc setFragmentSamplerState:sampler atIndex:0];
     }
     [m->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:triVerts];
 
@@ -480,8 +491,8 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
     rp.depthAttachment.texture = _m->depthTex;
     rp.depthAttachment.loadAction = MTLLoadActionClear;
-    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-    rp.depthAttachment.clearDepth = 1.0; // Metal NDC depth [0,1], far = 1
+    rp.depthAttachment.storeAction = MTLStoreActionStore; // preserved across mid-frame Clear() pass restarts
+    rp.depthAttachment.clearDepth = 1.0;                  // Metal NDC depth [0,1], far = 1
 
     // Persistent per-frame render encoder; draw calls record into it until Present.
     _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
@@ -489,6 +500,7 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     [_m->enc setViewport:vp];
 
     _frameConstantsBuilt = false; // rebuild 3D frame constants lazily this frame
+    _in2DPhase = false;           // 3D scene first; interface (2D) phase starts later
     // Sun is on at frame start; the shadow pass toggles it off/on mid-frame.
     // (EnableSunLight(false) must not leak across frames -> unlit world.)
     _sunEnabled = true;
@@ -498,9 +510,40 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     _frameOpen = true;
 }
 
-void EngineMetal::Clear(bool /*clearZ*/, bool /*clear*/, PackedColor /*color*/)
+void EngineMetal::Clear(bool clearZ, bool clearColor, PackedColor color)
 {
-    // M1: clearing is handled by InitDraw's render pass loadAction.
+    // Mid-frame clear (e.g. the in-game options notebook / vehicle interiors
+    // clear depth before drawing 3D-in-UI content so it overlays the scene
+    // without the first-person weapon poking through).  Metal can't clear an
+    // attachment mid-encoder, so end the current encoder and start a new pass
+    // that loads the existing colour (unless also clearing it) and clears depth.
+    if (!_m || !_m->cmd || !_frameOpen || (!clearZ && !clearColor))
+        return;
+    if (_m->enc)
+    {
+        [_m->enc endEncoding];
+        _m->enc = nil;
+    }
+
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = _m->frameTex;
+    rp.colorAttachments[0].loadAction = clearColor ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (clearColor)
+    {
+        const float r = ((color >> 16) & 0xFF) / 255.0f;
+        const float g = ((color >> 8) & 0xFF) / 255.0f;
+        const float b = (color & 0xFF) / 255.0f;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, 1.0);
+    }
+    rp.depthAttachment.texture = _m->depthTex;
+    rp.depthAttachment.loadAction = clearZ ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = 1.0;
+
+    _m->enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
+    MTLViewport vp = {0.0, 0.0, (double)_w, (double)_h, 0.0, 1.0};
+    [_m->enc setViewport:vp];
 }
 
 void EngineMetal::FinishDraw()
@@ -508,6 +551,10 @@ void EngineMetal::FinishDraw()
     if (_frameOpen)
     {
         Engine::FinishDraw();
+        // FPS overlay (--fps) + viewer help text, drawn as the last 2D pass
+        // while the encoder is still open.  Mirrors EngineGL33::FinishDraw —
+        // without this call the overlay never renders on the Metal path.
+        DrawFinishTexts();
         _frameOpen = false;
     }
 }
@@ -620,6 +667,20 @@ void EngineMetal::HandleEvents()
                 if (GApp)
                     GApp->m_closeRequest = true;
                 break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                _focused = true;
+                if (GApp)
+                    GApp->m_appActive = true;
+                if (_mouseGrab && _window)
+                    SDL_SetWindowRelativeMouseMode(_window, true);
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                _focused = false;
+                if (GApp)
+                    GApp->m_appActive = false;
+                if (_window)
+                    SDL_SetWindowRelativeMouseMode(_window, false); // release so the OS cursor is free
+                break;
             case SDL_EVENT_KEY_DOWN:
                 if (!event.key.repeat)
                     SDLInput_BufferKeyEvent(event.key.scancode, true, Foundation::GlobalTickCount());
@@ -662,13 +723,34 @@ bool EngineMetal::IsOpen() const
 
 void EngineMetal::SetMouseGrab(bool grab)
 {
+    // Only hold the relative-mouse grab while the window is focused — otherwise
+    // the grab gets stranded when focus is lost and the player can't move on
+    // return (mirrors SDLEventWindow::SetMouseGrab).
+    _mouseGrab = grab;
     if (_window)
-        SDL_SetWindowRelativeMouseMode(_window, grab);
+        SDL_SetWindowRelativeMouseMode(_window, grab && _focused);
 }
 
 bool EngineMetal::SwitchRes(int w, int h, int /*bpp*/)
 {
     return true;
+}
+
+bool EngineMetal::SetSwapInterval(int interval)
+{
+    if (!_m || !_m->layer)
+        return false;
+    // CAMetalLayer.displaySyncEnabled: YES presents on the vertical blank
+    // (vsync), NO presents as soon as the GPU is done (uncapped).  Engine
+    // interval 0 = vsync off; 1 = on; -1 (adaptive) maps to on (no CAMetalLayer
+    // adaptive mode).  Driven by the Options > Video > Vsync setting.
+    _m->layer.displaySyncEnabled = (interval != 0);
+    return true;
+}
+
+int EngineMetal::GetSwapInterval() const
+{
+    return (_m && _m->layer && !_m->layer.displaySyncEnabled) ? 0 : 1;
 }
 
 void EngineMetal::ListResolutions(FindArray<ResolutionInfo>& /*ret*/) {}
@@ -711,6 +793,7 @@ static inline void SetV(Poseidon::TLVertex& v, float x, float y, float z, float 
 
 void EngineMetal::Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Rect2DAbs& clip)
 {
+    _in2DPhase = true; // immediate 2D => we're past the 3D scene this frame
     if (!pars.mip.IsOK() || !_m || !_m->enc)
         return;
     float xBeg = rect.x, xEnd = rect.x + rect.w;
@@ -741,12 +824,14 @@ void EngineMetal::Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Re
 
     auto* tm = static_cast<TextureMetal*>(pars.mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, pos, 4, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
+    EmitPolyFan(_m, pos, 4, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
+                _m->samplers[SamplerIdx(true, true, false)]);
 }
 
 void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DPixel* vertices, int n, const Rect2DPixel& /*clipRect*/,
                            int /*specFlags*/)
 {
+    _in2DPhase = true;
     if (n < 3 || !_m || !_m->enc)
         return;
     const int maxN = 64;
@@ -761,12 +846,14 @@ void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DPixel* vertices, in
     }
     auto* tm = static_cast<TextureMetal*>(mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
+    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
+                _m->samplers[SamplerIdx(true, true, false)]);
 }
 
 void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int n, const Rect2DAbs& /*clipRect*/,
                            int /*specFlags*/)
 {
+    _in2DPhase = true;
     if (n < 3 || !_m || !_m->enc)
         return;
     const int maxN = 64;
@@ -780,11 +867,13 @@ void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int 
     }
     auto* tm = static_cast<TextureMetal*>(mip._texture);
     id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
-    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
+    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->dss2D,
+                _m->samplers[SamplerIdx(true, true, false)]);
 }
 
 void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1, const Rect2DAbs& /*clip*/)
 {
+    _in2DPhase = true;
     if (!_m || !_m->enc)
         return;
     // Render as a 1px-thick quad perpendicular to the line direction.
@@ -798,7 +887,89 @@ void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1
     SetV(q[1], x1 + nx, y1 + ny, 0.5f, 1, c1);
     SetV(q[2], x1 - nx, y1 - ny, 0.5f, 1, c1);
     SetV(q[3], x0 - nx, y0 - ny, 0.5f, 1, c0);
-    EmitPolyFan(_m, q, 4, _m->psoFlat, nil, _w, _h);
+    EmitPolyFan(_m, q, 4, _m->psoFlat, nil, _w, _h, _m->dss2D, _m->samplers[SamplerIdx(true, true, false)]);
+}
+
+// ---- 2D TLVertexTable soup path (UI / options notebook) --------------------
+// BeginMesh hands us a screen-space TLVertex array; PrepareTriangle sets the
+// current texture; DrawPolygon/DrawSection draw indexed triangle fans into it.
+// Mirrors EngineGL33's AddVertices + QueuePrepareTriangle + QueueFan, but emits
+// each fan immediately through the same EmitPolyFan path as Draw2D/DrawPoly.
+
+void EngineMetal::BeginMesh(TLVertexTable& mesh, const render::LegacySpec& /*spec*/)
+{
+    if (!_m)
+        return;
+    _m->soupVerts = mesh.VertexData();
+    _m->soupCount = mesh.NVertex();
+    _m->soupTex = nil;
+    // Defaults until the first PrepareTriangle: depth-tested + repeat (terrain).
+    _m->soupDepth = _m->dss3D;
+    _m->soupSampler = _m->samplers[SamplerIdx(false, false, false)];
+}
+
+void EngineMetal::EndMesh(TLVertexTable& /*mesh*/)
+{
+    if (!_m)
+        return;
+    _m->soupVerts = nullptr;
+    _m->soupCount = 0;
+    _m->soupTex = nil;
+}
+
+void EngineMetal::PrepareTriangle(const MipInfo& mip, int specFlags)
+{
+    if (!_m)
+        return;
+    auto* tm = static_cast<TextureMetal*>(mip._texture);
+    _m->soupTex = tm ? tm->MetalTexture() : nil;
+
+    // Pick depth + sampler from the spec so depth-tested 3D content (terrain via
+    // LandscapeRender) integrates with the z-buffer, while NoZBuf 2D UI (the
+    // options notebook) draws on top without a depth test.
+    const render::LegacySpec spec = render::SplitLegacy((unsigned)specFlags);
+    const bool noZBuf = render::Has(spec.backend, render::Backend::NoZBuf);
+    const bool noZWrite = render::Has(spec.backend, render::Backend::NoZWrite);
+    // In the interface phase every soup draw is an overlay (the options notebook
+    // is a 3D model whose spec lacks NoZBuf) — force no depth test so the
+    // first-person weapon can't poke through it.
+    _m->soupDepth =
+        (_in2DPhase || noZBuf) ? _m->dss2D : (noZWrite ? _m->dss3DNoWrite : _m->dss3D);
+
+    const bool clampU = render::Has(spec.backend, render::Backend::ClampU);
+    const bool clampV = render::Has(spec.backend, render::Backend::ClampV);
+    const bool point = render::Has(spec.backend, render::Backend::PointSampling);
+    _m->soupSampler = _m->samplers[SamplerIdx(clampU, clampV, point)];
+}
+
+void EngineMetal::DrawPolygon(const VertexIndex* ii, int n)
+{
+    if (!_m || !_m->enc || !_m->soupVerts || n < 3)
+        return;
+    constexpr int kMaxFan = 256;
+    if (n > kMaxFan)
+        n = kMaxFan;
+    Poseidon::TLVertex fan[kMaxFan];
+    for (int i = 0; i < n; i++)
+    {
+        const int idx = ii[i];
+        if (idx < 0 || idx >= _m->soupCount)
+            return; // malformed index list — skip the whole fan
+        fan[i] = _m->soupVerts[idx];
+    }
+    id<MTLTexture> tex = _m->soupTex;
+    EmitPolyFan(_m, fan, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h, _m->soupDepth, _m->soupSampler);
+}
+
+void EngineMetal::DrawSection(const FaceArray& face, Offset beg, Offset end)
+{
+    if (!_m || !_m->soupVerts)
+        return;
+    for (Offset i = beg; i < end; face.Next(i))
+    {
+        const Poly& f = face[i];
+        DrawPolygon(f.GetVertexList(), f.N());
+    }
 }
 
 // ---- 3D mesh path (M3) -----------------------------------------------------
