@@ -176,6 +176,15 @@ endif()
 # on first configure (to fetch Corrosion). See engine/PoseidonRust/README.md.
 option(POSEIDON_ENABLE_RUST "Build the Rust FFI toolchain spike (Corrosion + RustSpike)" ON)
 
+# Route PoseidonFormats' PBO reader (pf_pbo_*) through the Rust PoseidonArchive
+# crate instead of the C++ QFBank path. Off by default; the C++ and Rust readers
+# are proven byte-for-byte equivalent by the PboParity test. Requires the Rust
+# build to be enabled.
+option(POSEIDON_PBO_USE_RUST "Back PoseidonFormats' PBO reader with the Rust PoseidonArchive crate" OFF)
+if(POSEIDON_PBO_USE_RUST AND NOT POSEIDON_ENABLE_RUST)
+    message(FATAL_ERROR "POSEIDON_PBO_USE_RUST requires POSEIDON_ENABLE_RUST=ON")
+endif()
+
 configure_file(
     ${CMAKE_SOURCE_DIR}/cmake/BuildConfig.h.in
     ${CMAKE_BINARY_DIR}/generated/BuildConfig.h
@@ -204,6 +213,14 @@ if(DIST_PRESET_NAME MATCHES "^(win|linux|mac)-([^-]+)(-(.*))?$")
     endif()
 endif()
 set(DIST_DIR "${CMAKE_SOURCE_DIR}/dist/${DIST_PRESET_NAME}")
+
+# Import the Rust crates (via Corrosion) before the engine subdirectories so
+# targets like PoseidonFormats can link them when POSEIDON_PBO_USE_RUST is on.
+# The consuming spike/test executables are added later (after the engine targets).
+if(POSEIDON_ENABLE_RUST)
+    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonRust.cmake)
+    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonArchive.cmake)
+endif()
 
 add_subdirectory(engine/Poseidon)
 add_subdirectory(engine/PoseidonGL33)
@@ -235,15 +252,13 @@ add_subdirectory(apps/tools/Studio)
 add_subdirectory(apps/tetris/Tetris)
 add_subdirectory(tests/unit/apps/Tetris)
 
-# Rust FFI toolchain spike (Corrosion-imported staticlib + RustSpike consumer),
-# plus the first real Rust module: PoseidonArchive (PBO reading).
+# Rust consumers/tests. The crates themselves are imported earlier (before the
+# engine subdirectories); these executables link the engine + Rust targets.
 if(POSEIDON_ENABLE_RUST)
-    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonRust.cmake)
-    add_subdirectory(apps/spikes/RustSpike)
-    include(${CMAKE_SOURCE_DIR}/cmake/PoseidonArchive.cmake)
-    add_subdirectory(apps/spikes/PboReadSpike)
+    add_subdirectory(apps/spikes/RustSpike)        # toolchain seam demo
+    add_subdirectory(apps/spikes/PboReadSpike)     # reads a PBO via Rust
     # Differential parity test: C++ (PoseidonFormats) vs Rust (PoseidonArchive).
-    add_subdirectory(apps/spikes/PboParitySpike)
+    add_subdirectory(tests/unit/engine/PoseidonArchive)
 endif()
 
 include(${CMAKE_SOURCE_DIR}/cmake/TridentCTest.cmake)

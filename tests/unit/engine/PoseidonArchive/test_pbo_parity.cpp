@@ -1,15 +1,21 @@
-// PboParitySpike — differential parity test between the C++ PBO reader
-// (PoseidonFormats' pf_pbo_* over QFBank) and the Rust reader (PoseidonArchive's
-// pa_pbo_* over papa-bear-archive). For every .pbo fixture it asserts both
-// readers expose the same set of entries and byte-for-byte identical decompressed
-// contents. This is the gate before routing any engine call site through Rust.
+// PBO reader parity test — the C++ reader (PoseidonFormats' pf_pbo_* over QFBank)
+// and the Rust reader (PoseidonArchive's pa_pbo_*) must agree, for every archive,
+// on the entry set and on byte-for-byte identical decompressed contents. This is
+// the regression gate guarding any switch of an engine call site to Rust.
 //
-// FIXTURES_DIR (a directory searched recursively for *.pbo) is injected by CMake.
+// Fixtures: the bundled tree (FIXTURES_DIR, injected by CMake) is always scanned.
+// Set POSEIDON_PBO_PARITY_DIR to additionally scan an external directory (e.g. a
+// game-data install) for broader, real-world coverage without rebuilding.
+//
+// NOTE: keep this comparing the two implementations — build with the default
+// POSEIDON_PBO_USE_RUST=OFF so pf_pbo_* is the C++ path. With the option ON both
+// sides are Rust and the comparison is trivially satisfied.
 #include "PoseidonFormats.h"
 #include "poseidon_archive.h"
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -20,8 +26,8 @@ using Bytes = std::vector<unsigned char>;
 using EntryMap = std::map<std::string, Bytes>;
 
 // OFP paths are case-insensitive and use backslashes internally; normalise so the
-// two readers' naming conventions don't cause spurious mismatches. Content bytes
-// are always compared raw.
+// readers' naming conventions don't cause spurious mismatches. Content is always
+// compared raw.
 static std::string normalize(const char* raw) {
     std::string s = raw ? raw : "";
     for (char& c : s) {
@@ -73,7 +79,7 @@ static EntryMap readWithRust(const std::string& path, int& err) {
     return out;
 }
 
-// Compare two readers' entry maps; returns number of mismatches (0 == parity).
+// Compare two readers' entry maps; returns the number of mismatches (0 == parity).
 static int diff(const std::string& pbo, const EntryMap& c, const EntryMap& r) {
     int mismatches = 0;
     if (c.size() != r.size()) {
@@ -106,6 +112,15 @@ static int diff(const std::string& pbo, const EntryMap& c, const EntryMap& r) {
     return mismatches;
 }
 
+static void collect(const char* dir, std::vector<std::string>& out) {
+    if (!dir || !fs::exists(dir)) return;
+    for (const auto& e : fs::recursive_directory_iterator(dir)) {
+        if (e.is_regular_file() && e.path().extension() == ".pbo") {
+            out.push_back(e.path().string());
+        }
+    }
+}
+
 int main() {
     if (!pf_init()) {
         std::fprintf(stderr, "pf_init() failed\n");
@@ -113,10 +128,11 @@ int main() {
     }
 
     std::vector<std::string> pbos;
-    for (const auto& e : fs::recursive_directory_iterator(FIXTURES_DIR)) {
-        if (e.is_regular_file() && e.path().extension() == ".pbo") {
-            pbos.push_back(e.path().string());
-        }
+    collect(FIXTURES_DIR, pbos);
+    if (const char* extra = std::getenv("POSEIDON_PBO_PARITY_DIR")) {
+        const size_t before = pbos.size();
+        collect(extra, pbos);
+        std::printf("Scanning external PBO dir %s (+%zu archives)\n", extra, pbos.size() - before);
     }
     if (pbos.empty()) {
         std::fprintf(stderr, "no .pbo fixtures found under %s\n", FIXTURES_DIR);
@@ -138,7 +154,7 @@ int main() {
 
     pf_shutdown();
     if (failures == 0) {
-        std::printf("PboParitySpike: C++ and Rust PBO readers agree on %zu archives\n", pbos.size());
+        std::printf("PBO parity: C++ and Rust readers agree on %zu archives\n", pbos.size());
     }
     return failures == 0 ? 0 : 1;
 }

@@ -455,6 +455,65 @@ PF_API void pf_image_get_rgba(PF_HANDLE img, uint8_t* buffer) {
 
 // ── PBO Archive ────────────────────────────────────────────────────────────
 
+#if defined(POSEIDON_PBO_USE_RUST)
+// PBO reading delegated to the Rust PoseidonArchive crate (pa_pbo_*). Selected by
+// the POSEIDON_PBO_USE_RUST build option; the C++ QFBank implementation in the
+// #else branch is the default and serves as the reference for the PboParity
+// differential test. The handle (PF_HANDLE) is the opaque PaPbo* from Rust.
+//
+// Return-value adaptation: the pa_pbo_* API uses -1/null sentinels, while the
+// pf_pbo_* contract returns 0 / "" for bad input — translated here so callers see
+// identical behaviour to the C++ path.
+#include "poseidon_archive.h"
+
+PF_API PF_HANDLE pf_pbo_open(const char* path) {
+    ClearError();
+    PaPbo* pbo = pa_pbo_open(path);
+    if (!pbo) SetError(pa_last_error());
+    return pbo;
+}
+
+PF_API void pf_pbo_close(PF_HANDLE pbo) {
+    pa_pbo_close(static_cast<PaPbo*>(pbo));
+}
+
+PF_API int pf_pbo_entry_count(PF_HANDLE pbo) {
+    int n = pa_pbo_entry_count(static_cast<PaPbo*>(pbo));
+    return n < 0 ? 0 : n;
+}
+
+PF_API const char* pf_pbo_entry_name(PF_HANDLE pbo, int idx) {
+    const char* name = pa_pbo_entry_name(static_cast<PaPbo*>(pbo), idx);
+    return name ? name : "";
+}
+
+PF_API int pf_pbo_entry_size(PF_HANDLE pbo, int idx) {
+    int size = pa_pbo_entry_size(static_cast<PaPbo*>(pbo), idx);
+    return size < 0 ? 0 : size;
+}
+
+PF_API int pf_pbo_extract(PF_HANDLE pbo, int idx, uint8_t* buffer, int buffer_size) {
+    ClearError();
+    if (!pbo || !buffer) return 0;
+    auto* p = static_cast<PaPbo*>(pbo);
+    int size = pa_pbo_extract(p, idx, nullptr, 0);  // size query
+    if (size < 0) { SetError(pa_last_error()); return 0; }
+    if (size <= buffer_size) {
+        int got = pa_pbo_extract(p, idx, buffer, buffer_size);
+        if (got < 0) { SetError(pa_last_error()); return 0; }
+        return got;
+    }
+    // Caller's buffer is smaller than the entry: match the C++ reader's
+    // truncating behaviour by extracting in full and copying the prefix.
+    std::vector<uint8_t> tmp(static_cast<size_t>(size));
+    int got = pa_pbo_extract(p, idx, tmp.data(), size);
+    if (got < 0) { SetError(pa_last_error()); return 0; }
+    memcpy(buffer, tmp.data(), static_cast<size_t>(buffer_size));
+    return buffer_size;
+}
+
+#else  // !POSEIDON_PBO_USE_RUST — default C++ QFBank implementation
+
 static void PboCollectEntry(const FileInfoO& fi, const FileBankType*, void* ctx) {
     auto* entries = static_cast<std::vector<PFPboEntry>*>(ctx);
     PFPboEntry e;
@@ -546,6 +605,8 @@ PF_API int pf_pbo_extract(PF_HANDLE pbo, int idx, uint8_t* buffer, int buffer_si
         return 0;
     }
 }
+
+#endif  // POSEIDON_PBO_USE_RUST
 
 // ── VFS (Virtual File System) ──────────────────────────────────────────────
 

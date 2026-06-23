@@ -12,6 +12,12 @@ target_include_directories(PoseidonFormats PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(PoseidonFormats PUBLIC Poseidon)
 target_compile_features(PoseidonFormats PRIVATE cxx_std_20)
 
+# Optionally back the PBO reader (pf_pbo_*) with the Rust PoseidonArchive crate.
+if(POSEIDON_PBO_USE_RUST)
+    target_link_libraries(PoseidonFormats PRIVATE PoseidonArchive)
+    target_compile_definitions(PoseidonFormats PRIVATE POSEIDON_PBO_USE_RUST=1)
+endif()
+
 # Shared library / DLL (for Blender addon, x64 only)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_library(PoseidonFormatsDLL SHARED ${PF_SOURCES})
