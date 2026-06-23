@@ -319,6 +319,10 @@ static bool LoadShaders(MetalState* m)
         sd.mipFilter = point ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
         sd.sAddressMode = clampU ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
         sd.tAddressMode = clampV ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
+        // 16x anisotropic filtering on the linear samplers — a free modern-GPU win
+        // the original engine never used; keeps terrain/road textures sharp at
+        // grazing angles instead of smearing into the distance.
+        sd.maxAnisotropy = point ? 1 : 16;
         m->samplers[i] = [m->device newSamplerStateWithDescriptor:sd];
     }
 
