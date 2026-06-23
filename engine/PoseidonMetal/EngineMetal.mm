@@ -261,9 +261,10 @@ static void BuildPipelines(MetalState* m, int sampleCount)
     const bool a2c = m->alphaToCoverage; // only effective on the opaque/cutout mesh PSOs + MSAA
     m->psoFlat = MakePSO(m->device, m->lib, "vsScreen", "psFlat", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc, false);
     m->psoNormal = MakePSO(m->device, m->lib, "vsScreen", "psNormal", cf, MtlBlend::Alpha, MakeTLVertexDescriptor(), sc, false);
-    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
-    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormal", cf, MtlBlend::Alpha, MakeSVertexDescriptor(), sc, false);
-    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetail", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
+    // 3D textured meshes use the per-pixel lit fragment shaders.
+    m->psoMesh = MakePSO(m->device, m->lib, "vsTransform", "psNormalLit", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
+    m->psoMeshBlend = MakePSO(m->device, m->lib, "vsTransform", "psNormalLit", cf, MtlBlend::Alpha, MakeSVertexDescriptor(), sc, false);
+    m->psoMeshDetail = MakePSO(m->device, m->lib, "vsTransform", "psDetailLit", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, a2c);
     m->psoMeshFlat = MakePSO(m->device, m->lib, "vsTransform", "psFlat", cf, MtlBlend::None, MakeSVertexDescriptor(), sc, false);
     // Dark-polygon sun shadow: black + shadowFactor alpha, ZERO/1-srcA darken blend.
     m->psoMeshShadow = MakePSO(m->device, m->lib, "vsShadow", "psShadow", cf, MtlBlend::Shadow, MakeSVertexDescriptor(), sc, a2c);
@@ -1651,6 +1652,7 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
         const bool point = passDesc.sampler.filter == render::SamplerFilter::Point;
         id<MTLSamplerState> samp = _m->samplers[SamplerIdx(passDesc.sampler.clampU, passDesc.sampler.clampV, point)];
         [_m->enc setFragmentBytes:_psShadow length:sizeof(_psShadow) atIndex:1];
+        [_m->enc setFragmentBytes:_vsShadow length:sizeof(_vsShadow) atIndex:2]; // VS constants for per-pixel lighting
         [_m->enc setFragmentTexture:tex atIndex:0];
         [_m->enc setFragmentSamplerState:samp atIndex:0];
         if (detail)

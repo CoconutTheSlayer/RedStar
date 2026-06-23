@@ -70,7 +70,75 @@ struct VOut
     float2 uv1;
     float  fogTC;
     float3 worldRel;
+    float3 worldNormal; // camera-relative world normal, for per-pixel lighting
 };
+
+// Sun + local point/spot lights + sun specular, evaluated at a world position /
+// normal.  Shared by vsTransform (per-vertex, for the untextured psFlat path) and
+// psNormalLit/psDetailLit (per-pixel).  Mirrors the GL33 vertex-lighting math.
+static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, thread float3& outSpec)
+{
+    float4 sunDir = vc.reg[VS_SUNDIR];
+    float4 ambient = vc.reg[VS_AMBIENT];
+    float4 diffuse = vc.reg[VS_DIFFUSE];
+    float4 emissive = vc.reg[VS_EMISSIVE];
+    float sunEn = vc.reg[VS_SUNEN].x;
+
+    float NdotL = max(0.0, dot(N, -sunDir.xyz));
+    float4 litColor;
+    litColor.rgb = emissive.rgb + ambient.rgb * sunEn + diffuse.rgb * NdotL * sunEn;
+    litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
+
+    // Local point/spot lights: quadratic falloff past startAtten, cut at 100x;
+    // spotlights gate by a cone factor (full inside cos 8deg, zero outside 12deg).
+    const float MIN_INSIDE2 = 0.95677279;
+    const float MAX_INSIDE2 = 0.98063081;
+    int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
+    for (int i = 0; i < nLights; i++)
+    {
+        float4 lp = vc.reg[VS_LIGHTPOS + i];
+        float4 ldir = vc.reg[VS_LIGHTDIR + i];
+        float3 toLight = lp.xyz - worldPos;
+        float size2 = dot(toLight, toLight);
+        float startAtten2 = lp.w * lp.w;
+        if (size2 >= startAtten2 * 100.0)
+            continue;
+
+        float cone = 1.0;
+        if (ldir.w > 0.5)
+        {
+            float inside = -dot(toLight, ldir.xyz);
+            if (inside <= 0.0)
+                continue;
+            float cos2 = (inside * inside) / size2;
+            if (cos2 < MIN_INSIDE2)
+                continue;
+            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
+        }
+
+        float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
+        float cosFi = dot(toLight, N);
+        float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
+        float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
+        if (cosFi > 0.0)
+            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone);
+        else
+            litColor.rgb += la * atten;
+    }
+    litColor = clamp(litColor, 0.0, 1.0);
+
+    float3 spec = float3(0.0);
+    float4 specC = vc.reg[VS_SPEC];
+    if (vc.reg[VS_SPECEN].x > 0.5 && sunEn > 0.0)
+    {
+        float3 viewDir = normalize(vc.reg[VS_CAMPOS].xyz - worldPos);
+        float3 halfVec = normalize(-sunDir.xyz + viewDir);
+        float NdotH = max(0.0, dot(N, halfVec));
+        spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
+    }
+    outSpec = clamp(spec, 0.0, 1.0);
+    return litColor;
+}
 
 // ---- Pre-transformed 2D (mirrors s_vsScreenGLSL) ----
 vertex VOut vsScreen(TLVertexIn vin [[stage_in]], constant VSConstants& vc [[buffer(1)]])
@@ -88,6 +156,7 @@ vertex VOut vsScreen(TLVertexIn vin [[stage_in]], constant VSConstants& vc [[buf
     o.uv1 = vin.uv1;
     o.fogTC = vin.specular.a;
     o.worldRel = float3(0.0);
+    o.worldNormal = float3(0.0);
     return o;
 }
 
@@ -108,67 +177,13 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     VOut o;
     o.position = proj * viewPos;
     o.worldRel = worldPos.xyz;
+    o.worldNormal = worldNormal;
 
-    float4 sunDir = vc.reg[VS_SUNDIR];
-    float4 ambient = vc.reg[VS_AMBIENT];
-    float4 diffuse = vc.reg[VS_DIFFUSE];
-    float4 emissive = vc.reg[VS_EMISSIVE];
-    float sunEn = vc.reg[VS_SUNEN].x;
-
-    float NdotL = max(0.0, dot(worldNormal, -sunDir.xyz));
-    float4 litColor;
-    litColor.rgb = emissive.rgb + ambient.rgb * sunEn + diffuse.rgb * NdotL * sunEn;
-    litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
-
-    // Local point/spot lights (lamps, headlights), per-vertex (mirrors GL33).
-    // Quadratic falloff past startAtten, cut off at 100x; spotlights gate by a
-    // cone factor (full inside cos 8deg, zero outside cos 12deg).
-    const float MIN_INSIDE2 = 0.95677279; // (cos 12deg)^2
-    const float MAX_INSIDE2 = 0.98063081; // (cos 8deg)^2
-    int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
-    for (int i = 0; i < nLights; i++)
-    {
-        float4 lp = vc.reg[VS_LIGHTPOS + i];
-        float4 ldir = vc.reg[VS_LIGHTDIR + i];
-        float3 toLight = lp.xyz - worldPos.xyz;
-        float size2 = dot(toLight, toLight);
-        float startAtten2 = lp.w * lp.w;
-        if (size2 >= startAtten2 * 100.0)
-            continue;
-
-        float cone = 1.0;
-        if (ldir.w > 0.5) // spotlight
-        {
-            float inside = -dot(toLight, ldir.xyz);
-            if (inside <= 0.0)
-                continue;
-            float cos2 = (inside * inside) / size2;
-            if (cos2 < MIN_INSIDE2)
-                continue;
-            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
-        }
-
-        float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
-        float cosFi = dot(toLight, worldNormal);
-        float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
-        float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
-        if (cosFi > 0.0)
-            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone);
-        else
-            litColor.rgb += la * atten;
-    }
-    o.color = clamp(litColor, 0.0, 1.0);
-
-    float3 spec = float3(0.0);
-    float4 specC = vc.reg[VS_SPEC];
-    if (vc.reg[VS_SPECEN].x > 0.5 && sunEn > 0.0)
-    {
-        float3 viewDir = normalize(vc.reg[VS_CAMPOS].xyz - worldPos.xyz);
-        float3 halfVec = normalize(-sunDir.xyz + viewDir);
-        float NdotH = max(0.0, dot(worldNormal, halfVec));
-        spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
-    }
-    o.spec = float4(clamp(spec, 0.0, 1.0), 0.0);
+    // Per-vertex lighting for the untextured psFlat path; psNormalLit/psDetailLit
+    // recompute this per-pixel from the interpolated worldRel/worldNormal.
+    float3 spec;
+    o.color = MeshLighting(vc, worldPos.xyz, worldNormal, spec);
+    o.spec = float4(spec, 0.0);
 
     float4 fog = vc.reg[VS_FOG];
     float dist = length(worldPos.xyz - vc.reg[VS_CAMPOS].xyz);
@@ -281,6 +296,52 @@ fragment float4 psDetail(VOut in [[stage_in]],
     float4 col = t0 * in.color;
     col.rgb *= t1.a * 2.0;
     col.rgb += in.spec.rgb;
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
+    return col;
+}
+
+// ---- Per-pixel lit variants (the powerful-hardware upgrade) ----
+// Same inputs as psNormal/psDetail, but the sun + local lighting is recomputed
+// per fragment from the interpolated world position/normal instead of being
+// interpolated from the vertices — smooth shading on low-poly geometry.  Needs
+// the VS constant block bound at fragment buffer(2).
+fragment float4 psNormalLit(VOut in [[stage_in]],
+                            constant PSConstants& pc [[buffer(1)]],
+                            constant VSConstants& vc [[buffer(2)]],
+                            texture2d<float> tex0 [[texture(0)]],
+                            sampler samp0 [[sampler(0)]])
+{
+    float3 spec;
+    float4 lit = MeshLighting(vc, in.worldRel, normalize(in.worldNormal), spec);
+    float4 col = tex0.sample(samp0, in.uv0) * lit;
+    col.rgb += spec;
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
+    return col;
+}
+
+fragment float4 psDetailLit(VOut in [[stage_in]],
+                            constant PSConstants& pc [[buffer(1)]],
+                            constant VSConstants& vc [[buffer(2)]],
+                            texture2d<float> tex0 [[texture(0)]],
+                            sampler samp0 [[sampler(0)]],
+                            texture2d<float> tex1 [[texture(1)]],
+                            sampler samp1 [[sampler(1)]])
+{
+    float3 spec;
+    float4 lit = MeshLighting(vc, in.worldRel, normalize(in.worldNormal), spec);
+    float4 col = tex0.sample(samp0, in.uv0) * lit;
+    col.rgb *= tex1.sample(samp1, in.uv1).a * 2.0;
+    col.rgb += spec;
 
     float4 alphaRef = pc.reg[PS_ALPHAREF];
     if (col.a - alphaRef.x * alphaRef.y < 0.0)
