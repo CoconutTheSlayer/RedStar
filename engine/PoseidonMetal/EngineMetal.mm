@@ -1,7 +1,7 @@
 #include <PoseidonMetal/EngineMetal.hpp>
 #include <PoseidonMetal/EngineFactoryMetal.hpp>
 
-#include <Poseidon/Graphics/Dummy/TextBankDummy.hpp>
+#include <PoseidonMetal/TextureMetal.hpp>
 #include <Poseidon/Graphics/Shared/ScreenshotWriter.hpp>
 #include <Poseidon/Graphics/Core/TLVertex.hpp>
 #include <Poseidon/Core/Application.hpp>
@@ -204,11 +204,12 @@ EngineMetal::EngineMetal(int width, int height, bool windowed, int bpp)
     _h = height;
     _pixelSize = bpp > 0 ? bpp : 32;
     _windowed = windowed;
-    _bank = new TextBankDummy();
     _m = new MetalState();
 
     if (!CreateWindowAndDevice(width, height, windowed))
         LOG_ERROR(Graphics, "Metal: initialization failed");
+
+    _bank = new TextBankMetal(_m->device); // device now exists
 }
 
 EngineMetal::~EngineMetal()
@@ -600,11 +601,18 @@ void EngineMetal::Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Re
     SetV(pos[1], xEnd, yBeg, 0.5f, 1, pars.colorTR);
     SetV(pos[2], xEnd, yEnd, 0.5f, 1, pars.colorBR);
     SetV(pos[3], xBeg, yEnd, 0.5f, 1, pars.colorBL);
-    EmitPolyFan(_m, pos, 4, _m->psoFlat, nil, _w, _h);
+    pos[0].t0 = {pars.uTL, pars.vTL};
+    pos[1].t0 = {pars.uTR, pars.vTR};
+    pos[2].t0 = {pars.uBR, pars.vBR};
+    pos[3].t0 = {pars.uBL, pars.vBL};
+
+    auto* tm = static_cast<TextureMetal*>(pars.mip._texture);
+    id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
+    EmitPolyFan(_m, pos, 4, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
-void EngineMetal::DrawPoly(const MipInfo& /*mip*/, const Vertex2DPixel* vertices, int n,
-                           const Rect2DPixel& /*clipRect*/, int /*specFlags*/)
+void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DPixel* vertices, int n, const Rect2DPixel& /*clipRect*/,
+                           int /*specFlags*/)
 {
     if (n < 3 || !_m || !_m->enc)
         return;
@@ -614,11 +622,16 @@ void EngineMetal::DrawPoly(const MipInfo& /*mip*/, const Vertex2DPixel* vertices
     Poseidon::TLVertex gv[64];
     const float x2d = Left2D(), y2d = Top2D();
     for (int i = 0; i < n; i++)
+    {
         SetV(gv[i], vertices[i].x + x2d, vertices[i].y + y2d, vertices[i].z, vertices[i].w, vertices[i].color);
-    EmitPolyFan(_m, gv, n, _m->psoFlat, nil, _w, _h);
+        gv[i].t0 = {vertices[i].u, vertices[i].v};
+    }
+    auto* tm = static_cast<TextureMetal*>(mip._texture);
+    id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
+    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
-void EngineMetal::DrawPoly(const MipInfo& /*mip*/, const Vertex2DAbs* vertices, int n, const Rect2DAbs& /*clipRect*/,
+void EngineMetal::DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int n, const Rect2DAbs& /*clipRect*/,
                            int /*specFlags*/)
 {
     if (n < 3 || !_m || !_m->enc)
@@ -628,8 +641,13 @@ void EngineMetal::DrawPoly(const MipInfo& /*mip*/, const Vertex2DAbs* vertices, 
         n = maxN;
     Poseidon::TLVertex gv[64];
     for (int i = 0; i < n; i++)
+    {
         SetV(gv[i], vertices[i].x, vertices[i].y, vertices[i].z, vertices[i].w, vertices[i].color);
-    EmitPolyFan(_m, gv, n, _m->psoFlat, nil, _w, _h);
+        gv[i].t0 = {vertices[i].u, vertices[i].v};
+    }
+    auto* tm = static_cast<TextureMetal*>(mip._texture);
+    id<MTLTexture> tex = tm ? tm->MetalTexture() : nil;
+    EmitPolyFan(_m, gv, n, tex ? _m->psoNormal : _m->psoFlat, tex, _w, _h);
 }
 
 void EngineMetal::DrawLine(const Line2DAbs& line, PackedColor c0, PackedColor c1, const Rect2DAbs& /*clip*/)

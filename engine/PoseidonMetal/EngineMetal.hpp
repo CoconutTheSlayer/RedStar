@@ -15,7 +15,7 @@ struct SDL_Window;
 
 namespace Poseidon
 {
-class TextBankDummy;
+class TextBankMetal;
 struct MetalState; // defined in EngineMetal.mm
 
 class EngineMetal : public Engine
@@ -23,7 +23,7 @@ class EngineMetal : public Engine
   private:
     MetalState* _m = nullptr; // all id<MTL...> / CAMetalLayer state (ObjC)
     SDL_Window* _window = nullptr;
-    TextBankDummy* _bank = nullptr; // placeholder bank until M4
+    TextBankMetal* _bank = nullptr;
 
     int _w = 640;
     int _h = 480;

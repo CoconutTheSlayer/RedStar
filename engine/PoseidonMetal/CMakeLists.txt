@@ -5,12 +5,14 @@ enable_language(OBJCXX)
 
 set(POSEIDON_METAL_SOURCES
     GraphicsBackendMetal.cpp   # pure C++ registration
-    EngineMetal.mm             # Objective-C++ engine (window/clear/present/screenshot)
+    EngineMetal.mm             # Objective-C++ engine (window/clear/present/2D/screenshot)
+    TextureMetal.mm            # texture + bank (decode -> BGRA8 upload)
 )
 
 set(POSEIDON_METAL_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/EngineMetal.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/EngineFactoryMetal.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/TextureMetal.hpp
 )
 
 add_library(PoseidonMetal STATIC
@@ -29,7 +31,7 @@ target_link_libraries(PoseidonMetal PUBLIC
 )
 
 # ARC for the Objective-C++ TUs (auto-manages id<MTL...> lifetimes).
-set_source_files_properties(EngineMetal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(EngineMetal.mm TextureMetal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 # --- Compile MSL shaders into a metallib at build time ---
 set(METAL_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/Shaders/Shaders.metal)
