@@ -128,14 +128,19 @@ static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, 
     litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
 
     // Local point/spot lights: quadratic falloff past startAtten, cut at 100x;
-    // spotlights gate by a cone factor (full inside cos 8deg, zero outside 12deg).
-    const float MIN_INSIDE2 = 0.95677279;
-    const float MAX_INSIDE2 = 0.98063081;
+    // spotlights gate by a cone factor (full inside the inner angle, zero past the
+    // outer).  Cone cos^2 angles are uploaded per-light in diffuse.w (inner) /
+    // ambient.w (outer); these defaults (~8deg / ~12deg) are the fallback when a
+    // spot doesn't supply them.
+    const float DEF_INNER2 = 0.98063081; // cos^2(8deg)
+    const float DEF_OUTER2 = 0.95677279; // cos^2(12deg)
     int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
     for (int i = 0; i < nLights; i++)
     {
         float4 lp = vc.reg[VS_LIGHTPOS + i];
         float4 ldir = vc.reg[VS_LIGHTDIR + i];
+        float4 ld4 = vc.reg[VS_LIGHTDIFF + i];
+        float4 la4 = vc.reg[VS_LIGHTAMB + i];
         float3 toLight = lp.xyz - worldPos;
         float size2 = dot(toLight, toLight);
         float startAtten2 = lp.w * lp.w;
@@ -149,9 +154,11 @@ static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, 
             if (inside <= 0.0)
                 continue;
             float cos2 = (inside * inside) / size2;
-            if (cos2 < MIN_INSIDE2)
+            float inner2 = (ld4.w > 0.0) ? ld4.w : DEF_INNER2;
+            float outer2 = (la4.w > 0.0 && la4.w < inner2) ? la4.w : DEF_OUTER2;
+            if (cos2 < outer2)
                 continue;
-            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
+            cone = clamp((cos2 - outer2) / (inner2 - outer2), 0.0, 1.0);
         }
         // The shadow-casting spot (w == 2) is masked by the depth map; everything
         // else is fully lit (spotShadow folded in as 1.0 by the caller).
@@ -159,8 +166,8 @@ static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, 
 
         float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
         float cosFi = dot(toLight, N);
-        float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
-        float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
+        float3 ld = ld4.rgb;
+        float3 la = la4.rgb;
         if (cosFi > 0.0)
             litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone * sh);
         else
