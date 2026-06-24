@@ -7,9 +7,10 @@
 // Set POSEIDON_PBO_PARITY_DIR to additionally scan an external directory (e.g. a
 // game-data install) for broader, real-world coverage without rebuilding.
 //
-// NOTE: keep this comparing the two implementations — build with the default
-// POSEIDON_PBO_USE_RUST=OFF so pf_pbo_* is the C++ path. With the option ON both
-// sides are Rust and the comparison is trivially satisfied.
+// The C++ side here always exercises the QFBank path: this target links
+// PoseidonFormatsRef (pinned to the C++ reader), not the regular PoseidonFormats,
+// so the comparison stays a genuine C++-vs-Rust check even when the engine
+// default (POSEIDON_PBO_USE_RUST) routes production through Rust.
 #include "PoseidonFormats.h"
 #include "poseidon_archive.h"
 

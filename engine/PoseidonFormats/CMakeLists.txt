@@ -18,6 +18,17 @@ if(POSEIDON_PBO_USE_RUST)
     target_compile_definitions(PoseidonFormats PRIVATE POSEIDON_PBO_USE_RUST=1)
 endif()
 
+# Reference build with the C++ QFBank PBO path forced on, never the Rust path.
+# Used only by the PBO parity test so it always compares the Rust reader against
+# the C++ reader — even once POSEIDON_PBO_USE_RUST is the default. Same single TU
+# as PoseidonFormats, so it's cheap.
+if(POSEIDON_ENABLE_RUST)
+    add_library(PoseidonFormatsRef STATIC ${PF_SOURCES})
+    target_include_directories(PoseidonFormatsRef PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(PoseidonFormatsRef PUBLIC Poseidon)
+    target_compile_features(PoseidonFormatsRef PRIVATE cxx_std_20)
+endif()
+
 # Shared library / DLL (for Blender addon, x64 only)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_library(PoseidonFormatsDLL SHARED ${PF_SOURCES})
