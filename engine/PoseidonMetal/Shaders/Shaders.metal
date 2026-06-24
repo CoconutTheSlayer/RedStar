@@ -29,6 +29,7 @@ struct WorldInstances { float4x4 world[256]; };
 #define VS_LIGHTDIFF 42  // [8]
 #define VS_LIGHTAMB 50   // [8]
 #define VS_LIGHTDIR 58   // [8]
+#define VS_SPOTVP   66   // mat4: shadow-casting spotlight view-projection (camera-relative world -> light clip)
 
 // PSConstants
 #define PS_FOGCOLOR 0
@@ -70,7 +71,122 @@ struct VOut
     float2 uv1;
     float  fogTC;
     float3 worldRel;
+    float3 worldNormal; // camera-relative world normal, for per-pixel lighting
 };
+
+// Normalized surface->camera direction, falling back when the surface sits at
+// the camera origin (first-person geometry) so normalize(0) can't produce NaN.
+static float3 viewSafe(float3 toView)
+{
+    return (dot(toView, toView) > 1e-8) ? normalize(toView) : float3(0.0, 0.0, 1.0);
+}
+
+// 3x3 PCF sample of the spotlight shadow map.  Returns 1.0 = fully lit, 0.0 =
+// fully shadowed.  worldPos is camera-relative world space (same space the light
+// view-projection VS_SPOTVP was built in).  Called only for the shadow-casting
+// spot (LightDir.w > 1.5); off-map / behind-light samples read as lit.
+static float SampleSpotShadow(depth2d<float> shadowTex, sampler shadowSamp, float4x4 lightVP, float3 worldPos)
+{
+    float4 lc = lightVP * float4(worldPos, 1.0);
+    if (lc.w <= 0.0)
+        return 1.0; // behind the light
+    float3 ndc = lc.xyz / lc.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5; // NDC -> tex (flip y for Metal top-left)
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0)
+        return 1.0; // outside the cone frustum
+    const float bias = 0.008; // ndc-space; also masks one-frame animation lag on character casters
+    float ref = ndc.z - bias;
+    float w = shadowTex.get_width();
+    float texel = 1.0 / w;
+    float lit = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            float d = shadowTex.sample(shadowSamp, uv + float2(dx, dy) * texel);
+            lit += (ref <= d) ? 1.0 : 0.0;
+        }
+    return lit * (1.0 / 9.0);
+}
+
+// Sun + local point/spot lights + sun specular, evaluated at a world position /
+// normal.  Shared by vsTransform (per-vertex, for the untextured psFlat path) and
+// psNormalLit/psDetailLit (per-pixel).  Mirrors the GL33 vertex-lighting math.
+// spotShadow (0..1) attenuates the shadow-casting spot (LightDir.w > 1.5); pass
+// 1.0 where no shadow map is sampled (the per-vertex path, and unshadowed spots).
+static float4 MeshLighting(constant VSConstants& vc, float3 worldPos, float3 N, thread float3& outSpec,
+                           float spotShadow)
+{
+    float4 sunDir = vc.reg[VS_SUNDIR];
+    float4 ambient = vc.reg[VS_AMBIENT];
+    float4 diffuse = vc.reg[VS_DIFFUSE];
+    float4 emissive = vc.reg[VS_EMISSIVE];
+    float sunEn = vc.reg[VS_SUNEN].x;
+
+    float NdotL = max(0.0, dot(N, -sunDir.xyz));
+    float4 litColor;
+    litColor.rgb = emissive.rgb + ambient.rgb * sunEn + diffuse.rgb * NdotL * sunEn;
+    litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
+
+    // Local point/spot lights: quadratic falloff past startAtten, cut at 100x;
+    // spotlights gate by a cone factor (full inside cos 8deg, zero outside 12deg).
+    const float MIN_INSIDE2 = 0.95677279;
+    const float MAX_INSIDE2 = 0.98063081;
+    int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
+    for (int i = 0; i < nLights; i++)
+    {
+        float4 lp = vc.reg[VS_LIGHTPOS + i];
+        float4 ldir = vc.reg[VS_LIGHTDIR + i];
+        float3 toLight = lp.xyz - worldPos;
+        float size2 = dot(toLight, toLight);
+        float startAtten2 = lp.w * lp.w;
+        if (size2 >= startAtten2 * 100.0)
+            continue;
+
+        float cone = 1.0;
+        if (ldir.w > 0.5) // spotlight (w == 1 plain, w == 2 shadow-casting)
+        {
+            float inside = -dot(toLight, ldir.xyz);
+            if (inside <= 0.0)
+                continue;
+            float cos2 = (inside * inside) / size2;
+            if (cos2 < MIN_INSIDE2)
+                continue;
+            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
+        }
+        // The shadow-casting spot (w == 2) is masked by the depth map; everything
+        // else is fully lit (spotShadow folded in as 1.0 by the caller).
+        float sh = (ldir.w > 1.5) ? spotShadow : 1.0;
+
+        float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
+        float cosFi = dot(toLight, N);
+        float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
+        float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
+        if (cosFi > 0.0)
+            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone * sh);
+        else
+            litColor.rgb += la * (atten * sh);
+    }
+    litColor = clamp(litColor, 0.0, 1.0);
+
+    float3 spec = float3(0.0);
+    float4 specC = vc.reg[VS_SPEC];
+    if (vc.reg[VS_SPECEN].x > 0.5 && sunEn > 0.0)
+    {
+        // Two normalize() guards (NaN -> 0 = black surface):
+        //  - toView ~ 0: first-person geometry sits at the camera origin.
+        //  - half-vector ~ 0: viewDir == sunDir when looking straight at a
+        //    backlit surface ("toward the light") — this was the black gun.
+        float3 toView = vc.reg[VS_CAMPOS].xyz - worldPos;
+        float3 hv = viewSafe(toView) - sunDir.xyz; // half-vector numerator
+        if (dot(hv, hv) > 1e-8)
+        {
+            float NdotH = max(0.0, dot(N, normalize(hv)));
+            spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
+        }
+    }
+    outSpec = clamp(spec, 0.0, 1.0);
+    return litColor;
+}
 
 // ---- Pre-transformed 2D (mirrors s_vsScreenGLSL) ----
 vertex VOut vsScreen(TLVertexIn vin [[stage_in]], constant VSConstants& vc [[buffer(1)]])
@@ -88,6 +204,7 @@ vertex VOut vsScreen(TLVertexIn vin [[stage_in]], constant VSConstants& vc [[buf
     o.uv1 = vin.uv1;
     o.fogTC = vin.specular.a;
     o.worldRel = float3(0.0);
+    o.worldNormal = float3(0.0);
     return o;
 }
 
@@ -108,67 +225,13 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     VOut o;
     o.position = proj * viewPos;
     o.worldRel = worldPos.xyz;
+    o.worldNormal = worldNormal;
 
-    float4 sunDir = vc.reg[VS_SUNDIR];
-    float4 ambient = vc.reg[VS_AMBIENT];
-    float4 diffuse = vc.reg[VS_DIFFUSE];
-    float4 emissive = vc.reg[VS_EMISSIVE];
-    float sunEn = vc.reg[VS_SUNEN].x;
-
-    float NdotL = max(0.0, dot(worldNormal, -sunDir.xyz));
-    float4 litColor;
-    litColor.rgb = emissive.rgb + ambient.rgb * sunEn + diffuse.rgb * NdotL * sunEn;
-    litColor.a = emissive.a + ambient.a * sunEn + diffuse.a * NdotL * sunEn;
-
-    // Local point/spot lights (lamps, headlights), per-vertex (mirrors GL33).
-    // Quadratic falloff past startAtten, cut off at 100x; spotlights gate by a
-    // cone factor (full inside cos 8deg, zero outside cos 12deg).
-    const float MIN_INSIDE2 = 0.95677279; // (cos 12deg)^2
-    const float MAX_INSIDE2 = 0.98063081; // (cos 8deg)^2
-    int nLights = int(vc.reg[VS_LIGHTCOUNT].x);
-    for (int i = 0; i < nLights; i++)
-    {
-        float4 lp = vc.reg[VS_LIGHTPOS + i];
-        float4 ldir = vc.reg[VS_LIGHTDIR + i];
-        float3 toLight = lp.xyz - worldPos.xyz;
-        float size2 = dot(toLight, toLight);
-        float startAtten2 = lp.w * lp.w;
-        if (size2 >= startAtten2 * 100.0)
-            continue;
-
-        float cone = 1.0;
-        if (ldir.w > 0.5) // spotlight
-        {
-            float inside = -dot(toLight, ldir.xyz);
-            if (inside <= 0.0)
-                continue;
-            float cos2 = (inside * inside) / size2;
-            if (cos2 < MIN_INSIDE2)
-                continue;
-            cone = clamp((cos2 - MIN_INSIDE2) / (MAX_INSIDE2 - MIN_INSIDE2), 0.0, 1.0);
-        }
-
-        float atten = (size2 >= startAtten2) ? (startAtten2 / size2) : 1.0;
-        float cosFi = dot(toLight, worldNormal);
-        float3 ld = vc.reg[VS_LIGHTDIFF + i].rgb;
-        float3 la = vc.reg[VS_LIGHTAMB + i].rgb;
-        if (cosFi > 0.0)
-            litColor.rgb += (ld * (cosFi * rsqrt(size2)) + la) * (atten * cone);
-        else
-            litColor.rgb += la * atten;
-    }
-    o.color = clamp(litColor, 0.0, 1.0);
-
-    float3 spec = float3(0.0);
-    float4 specC = vc.reg[VS_SPEC];
-    if (vc.reg[VS_SPECEN].x > 0.5 && sunEn > 0.0)
-    {
-        float3 viewDir = normalize(vc.reg[VS_CAMPOS].xyz - worldPos.xyz);
-        float3 halfVec = normalize(-sunDir.xyz + viewDir);
-        float NdotH = max(0.0, dot(worldNormal, halfVec));
-        spec = specC.rgb * pow(NdotH, max(1.0, specC.w)) * sunEn;
-    }
-    o.spec = float4(clamp(spec, 0.0, 1.0), 0.0);
+    // Per-vertex lighting for the untextured psFlat path; psNormalLit/psDetailLit
+    // recompute this per-pixel from the interpolated worldRel/worldNormal.
+    float3 spec;
+    o.color = MeshLighting(vc, worldPos.xyz, worldNormal, spec, 1.0);
+    o.spec = float4(spec, 0.0);
 
     float4 fog = vc.reg[VS_FOG];
     float dist = length(worldPos.xyz - vc.reg[VS_CAMPOS].xyz);
@@ -178,6 +241,27 @@ vertex VOut vsTransform(SVertexIn vin [[stage_in]],
     float4 texCtrl = vc.reg[VS_TEXCTRL];
     o.uv0 = (texCtrl.x > 0.5) ? (mat4At(vc, VS_TEXMAT0) * float4(vin.uv, 0, 1)).xy : vin.uv;
     o.uv1 = (texCtrl.y > 0.5) ? (mat4At(vc, VS_TEXMAT1) * float4(vin.uv, 0, 1)).xy : vin.uv;
+    return o;
+}
+
+// ---- Spotlight shadow depth pass ----
+// Renders captured opaque geometry from the flashlight's viewpoint into a
+// depth texture (VS_SPOTVP = light view-projection).  Reuses the SVertex layout
+// and the per-draw world matrix (buffer 2) from the main pass; depth-only, so
+// there is no fragment function.
+struct DepthOnlyOut
+{
+    float4 position [[position]];
+};
+vertex DepthOnlyOut vsSpotDepth(SVertexIn vin [[stage_in]],
+                                constant VSConstants& vc [[buffer(1)]],
+                                constant WorldInstances& wi [[buffer(2)]],
+                                uint iid [[instance_id]])
+{
+    float4x4 lightVP = mat4At(vc, VS_SPOTVP);
+    float4x4 world = wi.world[iid];
+    DepthOnlyOut o;
+    o.position = lightVP * (world * float4(vin.pos, 1.0));
     return o;
 }
 
@@ -281,6 +365,60 @@ fragment float4 psDetail(VOut in [[stage_in]],
     float4 col = t0 * in.color;
     col.rgb *= t1.a * 2.0;
     col.rgb += in.spec.rgb;
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
+    return col;
+}
+
+// ---- Per-pixel lit variants (the powerful-hardware upgrade) ----
+// Same inputs as psNormal/psDetail, but the sun + local lighting is recomputed
+// per fragment from the interpolated world position/normal instead of being
+// interpolated from the vertices — smooth shading on low-poly geometry.  Needs
+// the VS constant block bound at fragment buffer(2).
+fragment float4 psNormalLit(VOut in [[stage_in]],
+                            constant PSConstants& pc [[buffer(1)]],
+                            constant VSConstants& vc [[buffer(2)]],
+                            texture2d<float> tex0 [[texture(0)]],
+                            sampler samp0 [[sampler(0)]],
+                            depth2d<float> shadowTex [[texture(2)]],
+                            sampler shadowSamp [[sampler(2)]])
+{
+    float3 spec;
+    float3 N = (dot(in.worldNormal, in.worldNormal) > 1e-8) ? normalize(in.worldNormal) : float3(0.0, 1.0, 0.0);
+    float sh = SampleSpotShadow(shadowTex, shadowSamp, mat4At(vc, VS_SPOTVP), in.worldRel);
+    float4 lit = MeshLighting(vc, in.worldRel, N, spec, sh);
+    float4 col = tex0.sample(samp0, in.uv0) * lit;
+    col.rgb += spec;
+
+    float4 alphaRef = pc.reg[PS_ALPHAREF];
+    if (col.a - alphaRef.x * alphaRef.y < 0.0)
+        discard_fragment();
+
+    col.rgb = mix(pc.reg[PS_FOGCOLOR].rgb, col.rgb, in.fogTC);
+    return col;
+}
+
+fragment float4 psDetailLit(VOut in [[stage_in]],
+                            constant PSConstants& pc [[buffer(1)]],
+                            constant VSConstants& vc [[buffer(2)]],
+                            texture2d<float> tex0 [[texture(0)]],
+                            sampler samp0 [[sampler(0)]],
+                            texture2d<float> tex1 [[texture(1)]],
+                            sampler samp1 [[sampler(1)]],
+                            depth2d<float> shadowTex [[texture(2)]],
+                            sampler shadowSamp [[sampler(2)]])
+{
+    float3 spec;
+    float3 N = (dot(in.worldNormal, in.worldNormal) > 1e-8) ? normalize(in.worldNormal) : float3(0.0, 1.0, 0.0);
+    float sh = SampleSpotShadow(shadowTex, shadowSamp, mat4At(vc, VS_SPOTVP), in.worldRel);
+    float4 lit = MeshLighting(vc, in.worldRel, N, spec, sh);
+    float4 col = tex0.sample(samp0, in.uv0) * lit;
+    col.rgb *= tex1.sample(samp1, in.uv1).a * 2.0;
+    col.rgb += spec;
 
     float4 alphaRef = pc.reg[PS_ALPHAREF];
     if (col.a - alphaRef.x * alphaRef.y < 0.0)

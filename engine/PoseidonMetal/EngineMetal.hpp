@@ -44,6 +44,20 @@ class EngineMetal : public Engine
     bool _frameConstantsBuilt = false;
     render::LegacySpec _meshSpec = {};
 
+    // Spotlight (flashlight) shadow map.  The depth pass must precede the main
+    // pass that samples it, but the geometry only becomes known during the main
+    // pass — so casters captured in frame N are rendered at the start of frame
+    // N+1 (one-frame-deferred).  Everything is camera-relative, and the camera
+    // moves between the two frames, so the sampling matrix must add the camera
+    // delta (camera_now - camera_at_shadow_render) to re-express this frame's
+    // world positions in the shadow map's space.  _lightVPstd holds the light
+    // view-projection in standard (row-major, M*v) form; _shadowCamPos is the
+    // camera position the map was rendered relative to.
+    float _lightVPstd[16] = {};
+    float _shadowCamPos[3] = {};
+    bool _shadowCastPending = false;
+    bool _shadowValid = false;
+
   public:
     EngineMetal(int width, int height, bool windowed, int bpp);
     ~EngineMetal() override;
@@ -155,6 +169,10 @@ class EngineMetal : public Engine
     void BuildFrameConstants();
     void ApplyDetailTexgen(bool detail); // set VS texCtrl/texMat1 for the detail UV scale
     void UploadLocalLights(const LightList& lights, const TLMaterial& mat, float nightEffect);
+    // Build the spotlight view-projection (camera-relative world -> light clip) from
+    // a shadow-casting spot's pose; stashed in _lightVPpending for next frame's map.
+    void BuildSpotLightMatrix(const float posCamRel[3], const float dir[3], float range);
+    void RenderSpotShadowMap(); // depth-only pass into _m->spotShadowTex from _m->casters
 };
 
 } // namespace Poseidon
