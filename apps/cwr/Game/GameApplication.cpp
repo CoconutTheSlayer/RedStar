@@ -1026,6 +1026,10 @@ void GameApplication::RunMainLoop()
         {
             if (benchmarkFrameCount == 0)
             {
+                // Measure raw throughput, not the refresh-rate cap: vsync would
+                // peg both backends at the display rate and hide the difference.
+                if (GEngine)
+                    GEngine->SetSwapInterval(0);
                 benchmarkStartTick = GetTickCount();
                 benchmarkLastLogTick = benchmarkStartTick;
                 GTerrainProfile.Reset();

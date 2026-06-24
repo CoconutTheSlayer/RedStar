@@ -705,12 +705,14 @@ void Invoke(std::string_view args, std::string& out)
 // Cmd_Flashlight — like Cmd_SpawnLight but a *spot* (LightReflector ->
 // LTSpotLight) instead of an omni point light: a narrow forward cone that
 // tracks the player's facing (the attach transform follows the vehicle each
-// frame).  The shader gates the spotlight by a fixed ~8-12 deg cone.  This is
-// the lit cone only — it does NOT cast shadows yet (local-light shadow maps
-// are a separate, larger subsystem).
+// frame).  On the Metal backend the spot also casts a real shadow (the
+// per-light shadow map in EngineMetal).
 //
-// Usage:  flashlight            toggle on/off (~14 m full-intensity range)
-//         flashlight <metres>   (re)create at that range, on
+// Usage:  flashlight                       toggle on/off
+//         flashlight <metres>              (re)create at that range, shoulder mount
+//         flashlight <metres> eye|shoulder mount style (eye = realistic but few
+//                                          visible shadows; shoulder = offset so
+//                                          shadows are visible)
 namespace Cmd_Flashlight
 {
 namespace
@@ -732,12 +734,16 @@ void Invoke(std::string_view args, std::string& out)
     }
     Person* player = GWorld->GetRealPlayer();
 
-    // Optional full-intensity range in metres (the beam still fades out well
-    // past it).  Default ~14 m — a torch beam, not a searchlight.
+    // Args: "<metres> [eye|shoulder]".  metres = full-intensity range (default
+    // ~14 m).  Mount: "shoulder" (default) = above/behind the head, beam angled
+    // down so cast shadows are clearly visible; "eye" = a realistic hand-held
+    // torch at eye level — looks natural but, being near the camera, hides most
+    // cast shadows behind their casters.
     float range = 14.0f;
+    bool eyeLevel = false;
     if (!args.empty())
     {
-        char tmp[32];
+        char tmp[48];
         size_t n = args.size();
         if (n >= sizeof(tmp))
         {
@@ -746,23 +752,34 @@ void Invoke(std::string_view args, std::string& out)
         }
         std::memcpy(tmp, args.data(), n);
         tmp[n] = 0;
+        char mount[16] = {0};
         float v = 0.0f;
-        if (sscanf(tmp, "%f", &v) != 1 || v < 1.0f)
+        const int got = sscanf(tmp, "%f %15s", &v, mount);
+        if (got < 1 || v < 1.0f)
         {
-            out = "flashlight: expected <metres> (>= 1), got: " + std::string(args);
+            out = "flashlight: expected <metres> (>= 1) [eye|shoulder], got: " + std::string(args);
             return;
         }
         range = v;
+        if (got >= 2)
+        {
+            if (!stricmp(mount, "eye"))
+                eyeLevel = true;
+            else if (stricmp(mount, "shoulder"))
+            {
+                out = "flashlight: mount must be 'eye' or 'shoulder', got: " + std::string(mount);
+                return;
+            }
+        }
     }
 
     if (!s_light || s_light->AttachedOn() != player || !args.empty())
     {
-        // Mounted above and slightly behind the head, beam angled down — an
-        // over-the-shoulder spot.  Offsetting the light off the eye line is what
-        // makes cast shadows visible (a light *at* the camera hides every shadow
-        // behind its caster).
-        Vector3 pos(0, 2.3f, -0.3f);
-        Vector3 dir(0, -0.45f, 1.0f);
+        // shoulder: above + slightly behind the head, beam angled down (visible
+        // shadows).  eye: at eye height, in the right hand, beam nearly level
+        // (realistic, few visible shadows).
+        Vector3 pos = eyeLevel ? Vector3(0.25f, 1.5f, 0.15f) : Vector3(0, 2.3f, -0.3f);
+        Vector3 dir = eyeLevel ? Vector3(0, -0.08f, 1.0f) : Vector3(0, -0.45f, 1.0f);
         dir.Normalize();
         Color diffuse(1.0f, 0.96f, 0.86f); // cool-white torch
         Color ambient(0.0f, 0.0f, 0.0f);   // crisp cone, no ambient wash
@@ -775,8 +792,8 @@ void Invoke(std::string_view args, std::string& out)
         s_light->SetBrightness(b * k * k);
         s_light->Switch(true);
         GScene->AddLight(s_light);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "flashlight: ON (spot on player, %.1f m range)", range);
+        char buf[80];
+        snprintf(buf, sizeof(buf), "flashlight: ON (%s mount, %.1f m range)", eyeLevel ? "eye" : "shoulder", range);
         out = buf;
         LOG_INFO(Mission, "DebugCheats::Flashlight -> {}", out);
         return;

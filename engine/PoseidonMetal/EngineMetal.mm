@@ -98,6 +98,7 @@ struct ShadowCaster
     id<MTLBuffer> ibo = nil;
     int firstIndex = 0;
     int indexCount = 0;
+    bool dynamic = false; // animated mesh — gets extra depth bias (one-frame lag acne)
     float world[16] = {};
 };
 
@@ -987,6 +988,29 @@ void EngineMetal::CaptureScreenshotIfPending()
     LOG_INFO(Graphics, "Metal: screenshot saved {}x{} -> {}", w, h, (const char*)path);
 }
 
+bool EngineMetal::SamplePixel(int x, int y, uint8_t* outRGB)
+{
+    // Read one pixel from the resolved scene target (frameTex, BGRA8, shared
+    // storage, top-left origin).  x/y arrive in window pixels (the tri verb uses
+    // Width()/Height()); frameTex may be renderScale x that, so map across.
+    if (!_m || !_m->frameTex || !outRGB)
+        return false;
+    if (_w <= 0 || _h <= 0 || x < 0 || y < 0 || x >= _w || y >= _h)
+        return false;
+    int fx = (int)((double)x * _m->texW / _w);
+    int fy = (int)((double)y * _m->texH / _h);
+    if (fx >= _m->texW)
+        fx = _m->texW - 1;
+    if (fy >= _m->texH)
+        fy = _m->texH - 1;
+    uint8_t bgra[4] = {0, 0, 0, 0};
+    [_m->frameTex getBytes:bgra bytesPerRow:4 fromRegion:MTLRegionMake2D(fx, fy, 1, 1) mipmapLevel:0];
+    outRGB[0] = bgra[2]; // R
+    outRGB[1] = bgra[1]; // G
+    outRGB[2] = bgra[0]; // B
+    return true;
+}
+
 // ---- Window / events -------------------------------------------------------
 
 void EngineMetal::HandleEvents()
@@ -1719,12 +1743,24 @@ void EngineMetal::RenderSpotShadowMap()
     [enc setRenderPipelineState:_m->psoSpotDepth];
     [enc setDepthStencilState:_m->dssSpotDepth];
     [enc setCullMode:MTLCullModeNone];
-    [enc setDepthBias:2.0f slopeScale:3.0f clamp:0.0f]; // push casters back to curb self-shadow acne
     [enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
+    bool dynBias = false; // track current bias so we only switch it when it changes
+    [enc setDepthBias:2.0f slopeScale:3.0f clamp:0.0f];
     for (const ShadowCaster& c : _m->casters)
     {
         if (!c.vbo || !c.ibo || c.indexCount <= 0)
             continue;
+        // Animated casters lag one frame (the depth pass is deferred), so their
+        // moved silhouette self-shadows; push them back harder to hide the acne
+        // at the cost of a slightly detached (peter-panned) shadow.
+        if (c.dynamic != dynBias)
+        {
+            dynBias = c.dynamic;
+            if (dynBias)
+                [enc setDepthBias:4.0f slopeScale:8.0f clamp:0.0f];
+            else
+                [enc setDepthBias:2.0f slopeScale:3.0f clamp:0.0f];
+        }
         [enc setVertexBuffer:c.vbo offset:0 atIndex:0];
         [enc setVertexBytes:c.world length:64 atIndex:2];
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -1783,19 +1819,33 @@ void EngineMetal::UploadLocalLights(const LightList& lights, const TLMaterial& m
             }
             dir[3] = spotFlag;
 
+            // Spot cone half-angles (cos^2), packed into the otherwise-unused .w
+            // of diffuse (inner) / ambient (outer): the shader fades the cone
+            // from full inside the inner angle to zero at the outer.  desc.theta /
+            // phi come from the light (LightReflector), so the lit cone matches
+            // the engine's reported cone instead of a hardcoded constant.  0 for
+            // point lights (cone unused there).
+            float innerC2 = 0.0f, outerC2 = 0.0f;
+            if (isSpot)
+            {
+                const float ci = cosf(desc.theta), co = cosf(desc.phi);
+                innerC2 = ci * ci;
+                outerC2 = co * co;
+            }
+
             const Color ld = desc.diffuse * matDif;
             float* df = _vsShadow + (VSlot::LightDiffuse + n) * 4;
             df[0] = ld.R();
             df[1] = ld.G();
             df[2] = ld.B();
-            df[3] = 0.0f;
+            df[3] = innerC2;
 
             const Color la = desc.ambient * matAmb;
             float* am = _vsShadow + (VSlot::LightAmbient + n) * 4;
             am[0] = la.R();
             am[1] = la.G();
             am[2] = la.B();
-            am[3] = 0.0f;
+            am[3] = outerC2;
 
             n++;
         }
@@ -1931,6 +1981,7 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
         sc.ibo = buf->ibo;
         sc.firstIndex = firstIndex;
         sc.indexCount = indexCount;
+        sc.dynamic = buf->_dynamic; // animated -> extra shadow bias (one-frame lag)
         memcpy(sc.world, _curWorld, 64);
         _m->casters.push_back(sc);
     }

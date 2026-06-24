@@ -102,6 +102,9 @@ class EngineMetal : public Engine
     // --- Screenshots (real) ---
     void Screenshot(RString filename) override { _pendingScreenshotPath = filename; }
     void FlushPendingScreenshot() override;
+    // Read one back-buffer (frameTex) pixel — enables the pixel-based render
+    // regression verbs (triSamplePixel / triGetPixelMaxChannel) on Metal.
+    bool SamplePixel(int x, int y, uint8_t* outRGB) override;
 
     // --- Gamma / pause ---
     void Pause() override {}
