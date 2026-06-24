@@ -39,10 +39,13 @@ cargo test --manifest-path engine/PoseidonArchive/Cargo.toml
 ctest --preset <preset> -R PboReadSpike
 ```
 
-## Toward parity
+## Status: the default PBO reader
 
-This maps onto the `pf_pbo_*` subset of `engine/PoseidonFormats/PoseidonFormats.h`.
-The natural next steps are wiring an actual engine call site (or the
-`PoseidonFormats` PBO path) to these functions and adding a differential test
-that reads the same archives through both the C++ and Rust readers to prove
-byte-for-byte parity before switching the default.
+`PoseidonFormats`' `pf_pbo_*` is now backed by this crate by default
+(`POSEIDON_PBO_USE_RUST`, which defaults to `POSEIDON_ENABLE_RUST` — i.e. ON
+wherever the Rust build is enabled; set it OFF to fall back to the C++ QFBank
+path). The `PoseidonArchive.PboParity` test keeps guarding the two
+implementations against each other: it links `PoseidonFormatsRef`, a reference
+build pinned to the C++ path, so the comparison stays a real C++-vs-Rust check
+regardless of the default. Parity is verified byte-for-byte on the bundled
+fixtures and on real game data (set `POSEIDON_PBO_PARITY_DIR`).

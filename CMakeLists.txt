@@ -177,10 +177,11 @@ endif()
 option(POSEIDON_ENABLE_RUST "Build the Rust FFI toolchain spike (Corrosion + RustSpike)" ON)
 
 # Route PoseidonFormats' PBO reader (pf_pbo_*) through the Rust PoseidonArchive
-# crate instead of the C++ QFBank path. Off by default; the C++ and Rust readers
-# are proven byte-for-byte equivalent by the PboParity test. Requires the Rust
-# build to be enabled.
-option(POSEIDON_PBO_USE_RUST "Back PoseidonFormats' PBO reader with the Rust PoseidonArchive crate" OFF)
+# crate instead of the C++ QFBank path. Defaults to ON wherever the Rust build is
+# enabled (the readers are proven byte-for-byte equivalent by the PboParity test);
+# falls back to the C++ path when Rust is disabled. The PboParity test keeps
+# comparing both regardless, via PoseidonFormatsRef.
+option(POSEIDON_PBO_USE_RUST "Back PoseidonFormats' PBO reader with the Rust PoseidonArchive crate" ${POSEIDON_ENABLE_RUST})
 if(POSEIDON_PBO_USE_RUST AND NOT POSEIDON_ENABLE_RUST)
     message(FATAL_ERROR "POSEIDON_PBO_USE_RUST requires POSEIDON_ENABLE_RUST=ON")
 endif()

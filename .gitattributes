@@ -14,6 +14,12 @@
 *.h text eol=crlf
 *.hpp text eol=crlf
 
+# cbindgen-generated C headers are written with LF by the generator. Override the
+# *.h CRLF rule so each build doesn't rewrite them (which would churn the working
+# tree and break the header-drift check). Compilers read LF headers fine.
+engine/PoseidonRust/include/poseidon_rust.h text eol=lf
+engine/PoseidonArchive/include/poseidon_archive.h text eol=lf
+
 # Markdown files
 *.md text eol=lf
 
