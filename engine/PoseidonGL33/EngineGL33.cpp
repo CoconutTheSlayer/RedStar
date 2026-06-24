@@ -5,6 +5,14 @@
 
 #include <SDL3/SDL.h>
 #include <glad/gl.h>
+// Poseidon's PCH defines a `DebugLog` macro that collides with ImGui's
+// ImGuiContext::DebugLog (imgui.h ~1146) — same guard DebugOverlay.cpp uses.
+#ifdef DebugLog
+#undef DebugLog
+#endif
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_opengl3.h>
 #include <Poseidon/Dev/Debug/DebugOverlay.hpp>
 
 using namespace Poseidon::Dev;
@@ -413,7 +421,7 @@ EngineGL33::EngineGL33(int width, int height, bool windowed, int bpp)
 
     // Initialize the ImGui debug overlay (font tuner + future panels).  Hidden
     // by default — F8 toggles.  Must be called after GL context exists.
-    DebugOverlay::Init(_sdlWindow, _glContext);
+    DebugOverlay::Init(_sdlWindow, this);
 
     // MSAA lives on the offscreen frame target; _msaaActive (the
     // alpha-to-coverage gate) is set when that target is created with
@@ -500,4 +508,44 @@ EngineGL33::~EngineGL33()
         SDL_DestroyWindow(_sdlWindow);
         _sdlWindow = nullptr;
     }
+}
+
+// --- Dev-overlay ImGui backend (GL33) ---------------------------------------
+// The ImGui GL renderer + SDL3-for-GL platform backend live here so the shared
+// DebugOverlay TU pulls in no GL symbols (M7 GL-leak removal).
+
+bool EngineGL33::OverlayBackendInit(SDL_Window* window)
+{
+    if (!ImGui_ImplSDL3_InitForOpenGL(window, _glContext))
+    {
+        LOG_ERROR(Graphics, "EngineGL33: ImGui_ImplSDL3_InitForOpenGL failed");
+        return false;
+    }
+    if (!ImGui_ImplOpenGL3_Init("#version 330"))
+    {
+        LOG_ERROR(Graphics, "EngineGL33: ImGui_ImplOpenGL3_Init failed");
+        ImGui_ImplSDL3_Shutdown();
+        return false;
+    }
+    return true;
+}
+
+void EngineGL33::OverlayBackendShutdown()
+{
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+}
+
+void EngineGL33::OverlayBackendNewFrame()
+{
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+}
+
+void EngineGL33::OverlayBackendRender()
+{
+    // Draw to the default framebuffer in case post-FX left an FBO bound; other
+    // GL state (blend, scissor, vao, depth) is saved/restored inside RenderDrawData.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }

@@ -20,10 +20,10 @@
 #endif
 
 #include <imgui.h>
-#include <imgui_impl_sdl3.h>
-#include <imgui_impl_opengl3.h>
+#include <imgui_impl_sdl3.h> // platform (event) backend only — no GL/Metal here
 #include <SDL3/SDL.h>
-#include <glad/gl.h>
+// Renderer backend (imgui_impl_opengl3 / imgui_impl_metal) + any glBindFramebuffer
+// live in the per-engine OverlayBackend* hooks so this shared TU pulls in no GL.
 
 #include <Poseidon/Dev/Debug/DebugOverlay.hpp>
 #include <Poseidon/Dev/Debug/DebugCheats.hpp>
@@ -80,6 +80,7 @@ bool s_visible = false;
 bool s_selectShadowsTab = false; // one-shot: force-select the Shadows tab next draw
 bool s_selectMemoryTab = false;  // one-shot: force-select the Memory tab next draw
 SDL_Window* s_window = nullptr;
+Engine* s_engine = nullptr; // owns the ImGui backend hooks; set in Init (GEngine isn't ready yet then)
 // Saved mouse-grab state while the dev panel holds the cursor released.
 bool s_mouseReleasedByPanel = false;
 bool s_savedMouseGrab = false;
@@ -1565,11 +1566,12 @@ void DrawMainWindow()
 }
 } // namespace
 
-void Init(SDL_Window* window, void* glContext)
+void Init(SDL_Window* window, Engine* engine)
 {
     if (s_initialized)
         return;
     s_window = window;
+    s_engine = engine;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1578,14 +1580,14 @@ void Init(SDL_Window* window, void* glContext)
     io.IniFilename = nullptr; // no imgui.ini side-effects
     ImGui::StyleColorsDark();
 
-    if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
+    // The active engine wires the ImGui platform+renderer backend (GL33 ->
+    // imgui_impl_opengl3, Metal -> imgui_impl_metal).  Returns false when the
+    // backend has no overlay support yet, leaving the overlay inert.
+    if (!s_engine || !s_engine->OverlayBackendInit(window))
     {
-        LOG_ERROR(Graphics, "DebugOverlay: ImGui_ImplSDL3_InitForOpenGL failed");
-        return;
-    }
-    if (!ImGui_ImplOpenGL3_Init("#version 330"))
-    {
-        LOG_ERROR(Graphics, "DebugOverlay: ImGui_ImplOpenGL3_Init failed");
+        LOG_ERROR(Graphics, "DebugOverlay: engine ImGui backend init failed/unsupported");
+        ImGui::DestroyContext();
+        s_engine = nullptr;
         return;
     }
 
@@ -1597,9 +1599,10 @@ void Shutdown()
 {
     if (!s_initialized)
         return;
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
+    if (s_engine)
+        s_engine->OverlayBackendShutdown();
     ImGui::DestroyContext();
+    s_engine = nullptr;
     s_initialized = false;
 }
 
@@ -1639,8 +1642,8 @@ void NewFrame()
     // after the game render), so we draw our own cursor as part of ImGui's
     // drawlist to stay on top.  When hidden, fall back to the engine cursor.
     ImGui::GetIO().MouseDrawCursor = s_visible;
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplSDL3_NewFrame();
+    if (s_engine)
+        s_engine->OverlayBackendNewFrame(); // renderer + SDL3 platform new-frame
     ImGui::NewFrame();
     if (s_visible)
         DrawMainWindow();
@@ -1651,11 +1654,11 @@ void Render()
     if (!s_initialized)
         return;
     ImGui::Render();
-    // Make sure we draw to the default framebuffer in case the engine left
-    // an FBO bound — happens with post-FX in GL33.  Other state (blend,
-    // scissor, vao, depth) is saved/restored inside RenderDrawData.
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    // The engine backend draws ImGui's draw data onto the final target (GL33
+    // binds FBO 0 first since post-FX may have left an FBO bound; Metal targets
+    // the drawable).  GL state save/restore lives inside the impl's RenderDrawData.
+    if (s_engine)
+        s_engine->OverlayBackendRender();
 
     // Drain deferred actions queued by UI click handlers.  See the
     // s_pendingActions comment for the why — running cheats here

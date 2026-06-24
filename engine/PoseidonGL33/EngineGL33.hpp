@@ -582,6 +582,13 @@ class EngineGL33 : public Engine
     void Pause() override;
     void Restore() override;
 
+    // Dev-overlay ImGui backend (imgui_impl_opengl3 + SDL3-for-GL). Implemented
+    // in EngineGL33.cpp; keeps the GL ImGui backend out of shared DebugOverlay.
+    bool OverlayBackendInit(SDL_Window* window) override;
+    void OverlayBackendShutdown() override;
+    void OverlayBackendNewFrame() override;
+    void OverlayBackendRender() override;
+
     void PreReset(bool hard);
     void PostReset();
 
