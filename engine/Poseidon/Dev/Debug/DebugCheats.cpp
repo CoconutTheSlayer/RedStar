@@ -757,9 +757,12 @@ void Invoke(std::string_view args, std::string& out)
 
     if (!s_light || s_light->AttachedOn() != player || !args.empty())
     {
-        // Mounted ~1.4 m up (head height), beam forward and slightly down.
-        Vector3 pos(0, 1.4f, 0.2f);
-        Vector3 dir(0, -0.12f, 1.0f);
+        // Mounted above and slightly behind the head, beam angled down — an
+        // over-the-shoulder spot.  Offsetting the light off the eye line is what
+        // makes cast shadows visible (a light *at* the camera hides every shadow
+        // behind its caster).
+        Vector3 pos(0, 2.3f, -0.3f);
+        Vector3 dir(0, -0.45f, 1.0f);
         dir.Normalize();
         Color diffuse(1.0f, 0.96f, 0.86f); // cool-white torch
         Color ambient(0.0f, 0.0f, 0.0f);   // crisp cone, no ambient wash

@@ -18,6 +18,7 @@
 #include <Poseidon/Foundation/Framework/Log.hpp>
 
 #include <cstddef> // offsetof
+#include <cmath>   // sqrtf / tanf / fabsf for the spotlight matrix
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -63,7 +64,8 @@ enum
     LightPos = 34,     // [MaxLocalLights] xyz camera-relative pos, w = startAtten
     LightDiffuse = 42, // [MaxLocalLights] rgb diffuse * mat * nightEffect
     LightAmbient = 50, // [MaxLocalLights] rgb ambient * mat * nightEffect
-    LightDir = 58,     // [MaxLocalLights] xyz beam dir, w = isSpot
+    LightDir = 58,     // [MaxLocalLights] xyz beam dir, w = 0 point / 1 spot / 2 shadow-casting spot
+    SpotVP = 66,       // mat4: shadow-casting spotlight view-projection
 };
 constexpr int MaxLocalLights = 8;
 } // namespace VSlot
@@ -76,6 +78,18 @@ enum
     ConstColor = 3,
 };
 } // namespace PSlot
+
+// One opaque mesh draw captured during the main pass, replayed into the
+// spotlight shadow map at the start of the next frame (one-frame-deferred so the
+// geometry is known before the depth pass that must precede the main pass).
+struct ShadowCaster
+{
+    id<MTLBuffer> vbo = nil; // retained snapshot — dynamic meshes get a fresh vbo per frame
+    id<MTLBuffer> ibo = nil;
+    int firstIndex = 0;
+    int indexCount = 0;
+    float world[16] = {};
+};
 
 // All Objective-C / Metal state lives here so EngineMetal.hpp stays pure C++.
 struct MetalState
@@ -145,6 +159,15 @@ struct MetalState
     uint64_t frameCount = 0;
     id<MTLBuffer> curRing = nil;
     size_t ringUsed = 0;
+
+    // Spotlight shadow map (flashlight): a single depth texture rendered from the
+    // light's viewpoint each frame, sampled by the per-pixel mesh shaders.
+    static constexpr int kSpotShadowSize = 2048;
+    id<MTLTexture> spotShadowTex = nil;
+    id<MTLRenderPipelineState> psoSpotDepth = nil; // vsSpotDepth, depth-only
+    id<MTLDepthStencilState> dssSpotDepth = nil;   // LEQUAL + write
+    id<MTLSamplerState> shadowSampler = nil;       // clamp, nearest (manual PCF)
+    std::vector<ShadowCaster> casters;             // captured this frame, drawn next
 };
 
 // Build a MTLVertexDescriptor matching the TLVertex memory layout. Offsets come
@@ -391,6 +414,45 @@ static bool LoadShaders(MetalState* m)
                               mipmapLevel:0
                                 withBytes:white
                               bytesPerRow:4];
+    }
+
+    // Spotlight shadow map: a depth-only pipeline (no fragment shader), a fixed
+    // 2048^2 Depth32Float texture, a LEQUAL+write depth state, and a clamped
+    // nearest sampler (the shader does manual 3x3 PCF).
+    {
+        id<MTLFunction> sdvs = [m->lib newFunctionWithName:@"vsSpotDepth"];
+        MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = sdvs;
+        pd.fragmentFunction = nil; // depth-only
+        pd.vertexDescriptor = MakeSVertexDescriptor();
+        pd.rasterSampleCount = 1;
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        NSError* serr = nil;
+        m->psoSpotDepth = [m->device newRenderPipelineStateWithDescriptor:pd error:&serr];
+        if (!m->psoSpotDepth)
+            LOG_ERROR(Graphics, "Metal: spot-depth PSO failed: {}",
+                      serr ? [[serr localizedDescription] UTF8String] : "?");
+
+        MTLDepthStencilDescriptor* dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = MTLCompareFunctionLessEqual;
+        dd.depthWriteEnabled = YES;
+        m->dssSpotDepth = [m->device newDepthStencilStateWithDescriptor:dd];
+
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                               width:MetalState::kSpotShadowSize
+                                                              height:MetalState::kSpotShadowSize
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        m->spotShadowTex = [m->device newTextureWithDescriptor:td];
+
+        MTLSamplerDescriptor* ss = [[MTLSamplerDescriptor alloc] init];
+        ss.minFilter = MTLSamplerMinMagFilterNearest;
+        ss.magFilter = MTLSamplerMinMagFilterNearest;
+        ss.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        ss.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        m->shadowSampler = [m->device newSamplerStateWithDescriptor:ss];
     }
 
     LOG_INFO(Graphics, "Metal: shaders loaded (2D={}, mesh={})", m->psoFlat != nil, m->psoMesh != nil);
@@ -695,6 +757,28 @@ void EngineMetal::InitDraw(bool clear, PackedColor color)
     _m->ringUsed = 0;
 
     _m->cmd = [_m->queue commandBuffer];
+
+    // Spotlight shadow map: render the casters captured during the PREVIOUS frame
+    // (the geometry is only known mid-frame, but this depth pass must precede the
+    // main pass that samples it — so it's deferred one frame).  _shadowValid gates
+    // both this frame's sampling and the dir.w=2 flag set in UploadLocalLights.
+    _shadowValid = _shadowCastPending && !_m->casters.empty();
+    if (_shadowValid)
+    {
+        // _cameraPos here is still last frame's value (BuildFrameConstants updates
+        // it during the upcoming main pass) — i.e. the camera the deferred casters
+        // and light matrix are relative to.
+        _shadowCamPos[0] = _cameraPos[0];
+        _shadowCamPos[1] = _cameraPos[1];
+        _shadowCamPos[2] = _cameraPos[2];
+        RenderSpotShadowMap();
+    }
+    else
+    {
+        memset(_vsShadow + VSlot::SpotVP * 4, 0, 64); // zero matrix -> SampleSpotShadow early-outs to lit
+    }
+    _shadowCastPending = false;
+    _m->casters.clear();
 
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     SetupPassAttachments(rp, _m, clear ? MTLLoadActionClear : MTLLoadActionLoad, MTLLoadActionClear,
@@ -1361,6 +1445,9 @@ VertexBuffer* EngineMetal::CreateVertexBuffer(const Shape& src, VBType type)
     return nullptr;
 }
 
+static void Mat4MulRM(float* out, const float* a, const float* b); // defined below
+static void UploadMat4(float* reg, const float* Tstd);
+
 void EngineMetal::BuildFrameConstants()
 {
     if (_frameConstantsBuilt || !GScene)
@@ -1387,6 +1474,20 @@ void EngineMetal::BuildFrameConstants()
     // GL33's UploadFrameConstants zeroes VS_CAMPOS so fog dist = length(worldPos).
     float cp[4] = {0, 0, 0, 0};
     memcpy(_vsShadow + VSlot::CamPos * 4, cp, 16);
+
+    // Spotlight shadow sampling matrix.  The shadow map was rendered (at InitDraw)
+    // relative to last frame's camera (_shadowCamPos), but this frame's fragments
+    // are relative to _cameraPos.  Pre-translate world positions by the camera
+    // delta so the lookup lands in the map's space: reg = (lightVP * Translate(d)).
+    if (_shadowValid)
+    {
+        const float d[3] = {_cameraPos[0] - _shadowCamPos[0], _cameraPos[1] - _shadowCamPos[1],
+                            _cameraPos[2] - _shadowCamPos[2]};
+        const float tr[16] = {1, 0, 0, d[0], 0, 1, 0, d[1], 0, 0, 1, d[2], 0, 0, 0, 1};
+        float m[16];
+        Mat4MulRM(m, _lightVPstd, tr); // _lightVPstd is still last frame's here (set before SetMaterial runs)
+        UploadMat4(_vsShadow + VSlot::SpotVP * 4, m);
+    }
 
     Vector3 dir = sun ? sun->Direction() : Vector3(0, -1, 0);
     float sd[4] = {(float)dir.X(), (float)dir.Y(), (float)dir.Z(), 0};
@@ -1456,12 +1557,133 @@ void EngineMetal::SetMaterial(const TLMaterial& mat, const LightList& lights, co
     UploadLocalLights(lights, mat, sun ? sun->NightEffect() : 0.0f);
 }
 
+// Row-major 4x4 multiply: out = a * b (standard math, applied as out * v).
+static void Mat4MulRM(float* out, const float* a, const float* b)
+{
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+        {
+            float s = 0;
+            for (int k = 0; k < 4; k++)
+                s += a[r * 4 + k] * b[k * 4 + c];
+            out[r * 4 + c] = s;
+        }
+}
+
+// Write reg[0..3] = transpose(Tstd): mat4At loads reg rows as MSL columns, so a
+// standard (row-major, M*v) matrix must be transposed to round-trip as M.
+static void UploadMat4(float* reg, const float* Tstd)
+{
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            reg[i * 4 + j] = Tstd[j * 4 + i];
+}
+
+// Build the shadow-casting spot's view-projection from its camera-relative pose
+// and stash it (mat4At upload form) in _lightVPpending for next frame's depth
+// pass + this-coupled sampling.
+void EngineMetal::BuildSpotLightMatrix(const float eye[3], const float dirIn[3], float range)
+{
+    float d[3] = {dirIn[0], dirIn[1], dirIn[2]};
+    float dl = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (dl < 1e-6f)
+    {
+        d[0] = 0;
+        d[1] = 0;
+        d[2] = 1;
+        dl = 1;
+    }
+    d[0] /= dl;
+    d[1] /= dl;
+    d[2] /= dl;
+    float up[3] = {0, 1, 0};
+    if (fabsf(d[1]) > 0.95f) // beam near-vertical: pick a different up
+    {
+        up[0] = 0;
+        up[1] = 0;
+        up[2] = 1;
+    }
+
+    // RH look-at (view looks down -Z): s = right, u = up, f = forward(d).
+    float s[3] = {d[1] * up[2] - d[2] * up[1], d[2] * up[0] - d[0] * up[2], d[0] * up[1] - d[1] * up[0]};
+    float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+    if (sl < 1e-6f)
+        sl = 1;
+    s[0] /= sl;
+    s[1] /= sl;
+    s[2] /= sl;
+    float u[3] = {s[1] * d[2] - s[2] * d[1], s[2] * d[0] - s[0] * d[2], s[0] * d[1] - s[1] * d[0]};
+    float V[16] = {s[0],  s[1],  s[2],  -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]),
+                   u[0],  u[1],  u[2],  -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]),
+                   -d[0], -d[1], -d[2], (d[0] * eye[0] + d[1] * eye[1] + d[2] * eye[2]),
+                   0,     0,     0,     1};
+
+    // RH perspective, Metal NDC z in [0,1]; square map (aspect 1).
+    const float fovY = 0.72f; // ~41 deg — covers the lit cone (~24 deg) + penumbra
+    const float zn = 0.25f;
+    float zf = range * 8.0f;
+    if (zf < 20.0f)
+        zf = 20.0f;
+    const float ys = 1.0f / tanf(fovY * 0.5f);
+    const float xs = ys; // aspect 1
+    float P[16] = {xs, 0, 0, 0, 0, ys, 0, 0, 0, 0, zf / (zn - zf), zn * zf / (zn - zf), 0, 0, -1, 0};
+
+    // Standard (row-major, M*v) light view-projection; transposed to upload form
+    // only when written to a reg slot.  Kept in standard form so the sampling
+    // matrix can be post-multiplied by the camera-delta translation.
+    Mat4MulRM(_lightVPstd, P, V); // T = P * V
+    _shadowCastPending = true;
+}
+
+// Depth-only pass: replay the previous frame's captured opaque geometry from the
+// flashlight's viewpoint into _m->spotShadowTex.  Encoded at frame start (before
+// the main pass) so the main pass can sample it.
+void EngineMetal::RenderSpotShadowMap()
+{
+    if (!_m || !_m->cmd || !_m->spotShadowTex || !_m->psoSpotDepth || _m->casters.empty())
+        return;
+
+    // The depth-pass VS reads reg[66..69]; bind the (untranslated) light matrix
+    // we captured the casters with.  The main-pass sampling matrix gets the
+    // camera-delta correction added later in BuildFrameConstants.
+    UploadMat4(_vsShadow + VSlot::SpotVP * 4, _lightVPstd);
+
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = _m->spotShadowTex;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = 1.0;
+
+    id<MTLRenderCommandEncoder> enc = [_m->cmd renderCommandEncoderWithDescriptor:rp];
+    MTLViewport vp = {0, 0, (double)MetalState::kSpotShadowSize, (double)MetalState::kSpotShadowSize, 0, 1};
+    [enc setViewport:vp];
+    [enc setRenderPipelineState:_m->psoSpotDepth];
+    [enc setDepthStencilState:_m->dssSpotDepth];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setDepthBias:2.0f slopeScale:3.0f clamp:0.0f]; // push casters back to curb self-shadow acne
+    [enc setVertexBytes:_vsShadow length:sizeof(_vsShadow) atIndex:1];
+    for (const ShadowCaster& c : _m->casters)
+    {
+        if (!c.vbo || !c.ibo || c.indexCount <= 0)
+            continue;
+        [enc setVertexBuffer:c.vbo offset:0 atIndex:0];
+        [enc setVertexBytes:c.world length:64 atIndex:2];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:c.indexCount
+                         indexType:MTLIndexTypeUInt16
+                       indexBuffer:c.ibo
+                 indexBufferOffset:(NSUInteger)c.firstIndex * sizeof(uint16_t)];
+    }
+    [enc endEncoding];
+}
+
 // Per-vertex point/spot lights (lamps, headlights), gated by NightEffect and
 // camera-relative to match the shaders' camera-relative world space.  Mirrors
 // EngineGL33::UploadVSLights.
 void EngineMetal::UploadLocalLights(const LightList& lights, const TLMaterial& mat, float nightEffect)
 {
     int n = 0;
+    bool builtSpotShadow = false; // only the first spot drives the (single) shadow map
     if (nightEffect > 0.0f)
     {
         const Color matDif = mat.diffuse * nightEffect;
@@ -1489,7 +1711,18 @@ void EngineMetal::UploadLocalLights(const LightList& lights, const TLMaterial& m
             dir[0] = beam.X();
             dir[1] = beam.Y();
             dir[2] = beam.Z();
-            dir[3] = isSpot ? 1.0f : 0.0f;
+            // Spot dir.w: 1 = plain spot, 2 = shadow-casting spot (sampled this
+            // frame).  The first spot builds the shadow matrix for next frame;
+            // it's flagged shadow-casting only once the map is actually populated.
+            float spotFlag = isSpot ? 1.0f : 0.0f;
+            if (isSpot && !builtSpotShadow)
+            {
+                BuildSpotLightMatrix(p, dir, desc.startAtten);
+                builtSpotShadow = true;
+                if (_shadowValid)
+                    spotFlag = 2.0f;
+            }
+            dir[3] = spotFlag;
 
             const Color ld = desc.diffuse * matDif;
             float* df = _vsShadow + (VSlot::LightDiffuse + n) * 4;
@@ -1629,6 +1862,20 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
                          : _m->psoMesh;
         dss = noZWrite ? _m->dss3DNoWrite : _m->dss3D;
     }
+    // Capture opaque solid geometry as a shadow caster for next frame's spot
+    // shadow map.  Skip projected-shadow polys, translucent surfaces, and
+    // depth-read-only passes — none should occlude the flashlight beam.
+    if (!isShadow && !useBlend && !noZWrite)
+    {
+        ShadowCaster sc;
+        sc.vbo = buf->vbo;
+        sc.ibo = buf->ibo;
+        sc.firstIndex = firstIndex;
+        sc.indexCount = indexCount;
+        memcpy(sc.world, _curWorld, 64);
+        _m->casters.push_back(sc);
+    }
+
     [_m->enc setRenderPipelineState:pso];
     [_m->enc setDepthStencilState:dss];
     [_m->enc setStencilReferenceValue:0]; // shadow EQUAL-0 / non-shadow REPLACE-0 reference
@@ -1655,6 +1902,11 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
         [_m->enc setFragmentBytes:_vsShadow length:sizeof(_vsShadow) atIndex:2]; // VS constants for per-pixel lighting
         [_m->enc setFragmentTexture:tex atIndex:0];
         [_m->enc setFragmentSamplerState:samp atIndex:0];
+        // Spotlight shadow map (texture/sampler 2): always bound for psNormalLit/
+        // psDetailLit; when no flashlight is active the matrix is zeroed so the
+        // shader early-outs without sampling.
+        [_m->enc setFragmentTexture:_m->spotShadowTex atIndex:2];
+        [_m->enc setFragmentSamplerState:_m->shadowSampler atIndex:2];
         if (detail)
         {
             // Detail texture always tiles (uv0*32) — force the repeat sampler.
