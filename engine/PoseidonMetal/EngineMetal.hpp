@@ -110,6 +110,14 @@ class EngineMetal : public Engine
     float GetGamma() const override { return 1.0f; }
     void FogColorChanged(const Color& c) override;
 
+    // Dev-overlay ImGui backend (imgui_impl_metal + SDL3-for-Metal). Implemented
+    // in EngineMetal.mm; mirrors the GL33 hooks so DebugOverlay stays GL/Metal-
+    // agnostic.  RenderDrawData targets a drawable-backed pass created in Present.
+    bool OverlayBackendInit(SDL_Window* window) override;
+    void OverlayBackendShutdown() override;
+    void OverlayBackendNewFrame() override;
+    void OverlayBackendRender() override;
+
     // --- Texture bank (placeholder Dummy bank for M1) ---
     AbstractTextBank* TextBank() override;
     void TextureDestroyed(Texture*) override {}

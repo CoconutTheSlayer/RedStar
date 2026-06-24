@@ -28,6 +28,16 @@
 
 #include <vector>
 
+// Dev-overlay ImGui backend (Metal). Poseidon's DebugLog macro collides with
+// ImGuiContext::DebugLog — undef before including imgui (same guard GL33 uses).
+#include <Poseidon/Dev/Debug/DebugOverlay.hpp>
+#ifdef DebugLog
+#undef DebugLog
+#endif
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_metal.h>
+
 // Shared SDL input buffers (InputProcessing_sdl.cpp) — same handlers GL33/Dummy use.
 extern void SDLInput_BufferKeyEvent(SDL_Scancode sc, bool down, DWORD timestamp);
 extern void SDLInput_BufferMouseButton(int btn, bool down);
@@ -168,6 +178,11 @@ struct MetalState
     id<MTLDepthStencilState> dssSpotDepth = nil;   // LEQUAL + write
     id<MTLSamplerState> shadowSampler = nil;       // clamp, nearest (manual PCF)
     std::vector<ShadowCaster> casters;             // captured this frame, drawn next
+
+    // Dev-overlay (ImGui) — rendered into a drawable-backed pass at Present time.
+    bool imguiReady = false;
+    MTLRenderPassDescriptor* overlayPassDesc = nil;   // valid only during the Present overlay pass
+    id<MTLRenderCommandEncoder> overlayEnc = nil;     // ditto — what RenderDrawData encodes into
 };
 
 // Build a MTLVertexDescriptor matching the TLVertex memory layout. Offsets come
@@ -610,6 +625,10 @@ bool EngineMetal::CreateWindowAndDevice(int width, int height, bool windowed)
 
     if (!LoadShaders(_m))
         LOG_ERROR(Graphics, "Metal: shader load failed — rendering will be clear-only");
+
+    // Dev overlay (ImGui) — device + window are ready.  Mirrors EngineGL33::Init;
+    // the overlay gates its own visibility on --dev and renders in Present().
+    Dev::DebugOverlay::Init(_window, this);
     return true;
 }
 
@@ -618,6 +637,7 @@ void EngineMetal::DestroyMetal()
     if (!_m)
         return;
     LOG_INFO(Graphics, "Metal: Destroying engine");
+    Dev::DebugOverlay::Shutdown(); // before the device/queue go away
     _m->frameTex = nil;
     _m->cmd = nil;
     _m->queue = nil;
@@ -856,6 +876,27 @@ void EngineMetal::Present()
         _m->enc = nil;
     }
 
+    // Dev overlay: composite ImGui into the resolved scene target (frameTex)
+    // before the present blit — so it both shows on screen and lands in
+    // screenshots (which read frameTex), matching the GL33 path.  Rendered at
+    // frameTex resolution; under SSAA (renderScale>1) the UI is supersampled
+    // with the scene, which is fine.
+    if (_m->imguiReady && _m->frameTex)
+    {
+        MTLRenderPassDescriptor* orp = [MTLRenderPassDescriptor renderPassDescriptor];
+        orp.colorAttachments[0].texture = _m->frameTex;
+        orp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        orp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> oe = [_m->cmd renderCommandEncoderWithDescriptor:orp];
+        _m->overlayPassDesc = orp;
+        _m->overlayEnc = oe;
+        Dev::DebugOverlay::NewFrame(); // builds the UI + ImGui_ImplMetal/SDL3 NewFrame
+        Dev::DebugOverlay::Render();   // ImGui::Render + RenderDrawData into oe
+        [oe endEncoding];
+        _m->overlayEnc = nil;
+        _m->overlayPassDesc = nil;
+    }
+
     id<CAMetalDrawable> drawable = [_m->layer nextDrawable];
     if (drawable)
     {
@@ -953,6 +994,12 @@ void EngineMetal::HandleEvents()
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
+        // Feed the dev overlay first; when its panel has keyboard/mouse focus,
+        // swallow those events so typing in the console doesn't also drive the
+        // game (mirrors the GL33 path's WantsKeyboard/WantsMouse gating).
+        Dev::DebugOverlay::ProcessEvent(event);
+        const bool imWantKbd = Dev::DebugOverlay::WantsKeyboard();
+        const bool imWantMouse = Dev::DebugOverlay::WantsMouse();
         switch (event.type)
         {
             case SDL_EVENT_QUIT:
@@ -975,20 +1022,28 @@ void EngineMetal::HandleEvents()
                     SDL_SetWindowRelativeMouseMode(_window, false); // release so the OS cursor is free
                 break;
             case SDL_EVENT_KEY_DOWN:
+                if (imWantKbd)
+                    break;
                 if (!event.key.repeat)
                     SDLInput_BufferKeyEvent(event.key.scancode, true, Foundation::GlobalTickCount());
                 SDLInput_BufferUIKeyEvent(event.key.key, true);
                 break;
             case SDL_EVENT_KEY_UP:
+                if (imWantKbd)
+                    break;
                 SDLInput_BufferKeyEvent(event.key.scancode, false, Foundation::GlobalTickCount());
                 SDLInput_BufferUIKeyEvent(event.key.key, false);
                 break;
             case SDL_EVENT_TEXT_INPUT:
+                if (imWantKbd)
+                    break;
                 SDLInput_BufferUICharEvent(event.text.text);
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
             case SDL_EVENT_MOUSE_BUTTON_UP:
             {
+                if (imWantMouse)
+                    break;
                 int btn = event.button.button - 1;
                 if (btn == 1)
                     btn = 2;
@@ -998,9 +1053,13 @@ void EngineMetal::HandleEvents()
                 break;
             }
             case SDL_EVENT_MOUSE_MOTION:
+                if (imWantMouse)
+                    break;
                 SDLInput_BufferMouseMotion(event.motion.xrel, event.motion.yrel);
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
+                if (imWantMouse)
+                    break;
                 SDLInput_BufferMouseWheel(event.wheel.y);
                 break;
             default:
@@ -1919,6 +1978,54 @@ void EngineMetal::DrawSectionTL(const Shape& sMesh, int beg, int end)
                          indexType:MTLIndexTypeUInt16
                        indexBuffer:buf->ibo
                  indexBufferOffset:(NSUInteger)firstIndex * sizeof(uint16_t)];
+}
+
+// --- Dev-overlay ImGui backend (Metal) --------------------------------------
+// Mirrors EngineGL33's hooks (imgui_impl_metal + SDL3-for-Metal). NewFrame and
+// RenderDrawData run inside the Present overlay pass, where overlayPassDesc /
+// overlayEnc are live (see Present()).
+
+bool EngineMetal::OverlayBackendInit(SDL_Window* window)
+{
+    if (!_m || !_m->device)
+        return false;
+    if (!ImGui_ImplSDL3_InitForMetal(window))
+    {
+        LOG_ERROR(Graphics, "EngineMetal: ImGui_ImplSDL3_InitForMetal failed");
+        return false;
+    }
+    if (!ImGui_ImplMetal_Init(_m->device))
+    {
+        LOG_ERROR(Graphics, "EngineMetal: ImGui_ImplMetal_Init failed");
+        ImGui_ImplSDL3_Shutdown();
+        return false;
+    }
+    _m->imguiReady = true;
+    return true;
+}
+
+void EngineMetal::OverlayBackendShutdown()
+{
+    if (!_m || !_m->imguiReady)
+        return;
+    ImGui_ImplMetal_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    _m->imguiReady = false;
+}
+
+void EngineMetal::OverlayBackendNewFrame()
+{
+    if (!_m || !_m->imguiReady || !_m->overlayPassDesc)
+        return;
+    ImGui_ImplMetal_NewFrame(_m->overlayPassDesc);
+    ImGui_ImplSDL3_NewFrame();
+}
+
+void EngineMetal::OverlayBackendRender()
+{
+    if (!_m || !_m->imguiReady || !_m->overlayEnc || !_m->cmd)
+        return;
+    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), _m->cmd, _m->overlayEnc);
 }
 
 Engine* CreateEngineMetal(int w, int h, bool windowed, int bpp)
