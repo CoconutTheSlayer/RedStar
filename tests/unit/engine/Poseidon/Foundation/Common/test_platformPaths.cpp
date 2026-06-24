@@ -113,17 +113,22 @@ TEST_CASE("Different app names produce different directories", "[platformPaths]"
     fs::remove_all(dir2);
 }
 
-TEST_CASE("Config, data, and cache dirs are distinct on Linux", "[platformPaths]")
+TEST_CASE("Config, data, and cache dirs follow the platform convention", "[platformPaths]")
 {
     std::string config = Poseidon::Foundation::getUserConfigDir("TestApp_Distinct");
     std::string data = Poseidon::Foundation::getUserDataDir("TestApp_Distinct");
     std::string cache = Poseidon::Foundation::getUserCacheDir("TestApp_Distinct");
 
-#ifndef _WIN32
-    // On Linux with XDG defaults, these should be different base paths
+#if defined(__linux__)
+    // Linux XDG defaults: .config / .local/share / .cache — three distinct bases.
     REQUIRE(config != data);
     REQUIRE(config != cache);
     REQUIRE(data != cache);
+#elif defined(__APPLE__)
+    // macOS convention: config and data both live under Application Support;
+    // only the cache (Library/Caches) is a distinct base.
+    REQUIRE(config == data);
+    REQUIRE(cache != config);
 #endif
     // All should contain the app name
     REQUIRE(config.find("TestApp_Distinct") != std::string::npos);
@@ -135,7 +140,28 @@ TEST_CASE("Config, data, and cache dirs are distinct on Linux", "[platformPaths]
     fs::remove_all(cache);
 }
 
-#ifndef _WIN32
+#if defined(__APPLE__)
+TEST_CASE("macOS dirs resolve under HOME/Library", "[platformPaths]")
+{
+    auto tmpHome = fs::temp_directory_path() / "test_mac_home";
+    fs::create_directories(tmpHome);
+
+    ScopedEnv homeEnv("HOME", tmpHome.c_str());
+
+    std::string config = Poseidon::Foundation::getUserConfigDir("TestApp_Mac");
+    std::string cache = Poseidon::Foundation::getUserCacheDir("TestApp_Mac");
+
+    // macOS ignores XDG and resolves relative to HOME (Apple conventions).
+    REQUIRE(config == (tmpHome / "Library/Application Support" / "TestApp_Mac").string());
+    REQUIRE(cache == (tmpHome / "Library/Caches" / "TestApp_Mac").string());
+    REQUIRE(dirExists(config));
+    REQUIRE(dirExists(cache));
+
+    fs::remove_all(tmpHome);
+}
+#endif
+
+#if defined(__linux__)
 TEST_CASE("getUserConfigDir respects XDG_CONFIG_HOME", "[platformPaths]")
 {
     // Use a temp directory to override XDG_CONFIG_HOME

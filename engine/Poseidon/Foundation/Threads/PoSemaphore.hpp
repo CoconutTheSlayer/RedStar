@@ -13,6 +13,14 @@ class PoSemaphore : public RefCountSafe
 
     HANDLE handle;
 
+#elif defined(__APPLE__)
+
+    // macOS does not implement unnamed POSIX semaphores (sem_init returns ENOSYS),
+    // so build a counting semaphore from a pthread mutex + condition variable.
+    pthread_mutex_t _mtx;
+    pthread_cond_t _cv;
+    long _count;
+
 #else
 
     sem_t sem;
