@@ -988,6 +988,29 @@ void EngineMetal::CaptureScreenshotIfPending()
     LOG_INFO(Graphics, "Metal: screenshot saved {}x{} -> {}", w, h, (const char*)path);
 }
 
+bool EngineMetal::SamplePixel(int x, int y, uint8_t* outRGB)
+{
+    // Read one pixel from the resolved scene target (frameTex, BGRA8, shared
+    // storage, top-left origin).  x/y arrive in window pixels (the tri verb uses
+    // Width()/Height()); frameTex may be renderScale x that, so map across.
+    if (!_m || !_m->frameTex || !outRGB)
+        return false;
+    if (_w <= 0 || _h <= 0 || x < 0 || y < 0 || x >= _w || y >= _h)
+        return false;
+    int fx = (int)((double)x * _m->texW / _w);
+    int fy = (int)((double)y * _m->texH / _h);
+    if (fx >= _m->texW)
+        fx = _m->texW - 1;
+    if (fy >= _m->texH)
+        fy = _m->texH - 1;
+    uint8_t bgra[4] = {0, 0, 0, 0};
+    [_m->frameTex getBytes:bgra bytesPerRow:4 fromRegion:MTLRegionMake2D(fx, fy, 1, 1) mipmapLevel:0];
+    outRGB[0] = bgra[2]; // R
+    outRGB[1] = bgra[1]; // G
+    outRGB[2] = bgra[0]; // B
+    return true;
+}
+
 // ---- Window / events -------------------------------------------------------
 
 void EngineMetal::HandleEvents()
