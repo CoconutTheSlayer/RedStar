@@ -17,11 +17,15 @@
 
 struct SDL_Window;
 union SDL_Event;
+namespace Poseidon { class Engine; }
 
 namespace Poseidon::Dev {
 namespace DebugOverlay
 {
-    void Init(SDL_Window* window, void* glContext);
+    // `engine` provides the ImGui backend hooks (GL33 / Metal).  Stored rather
+    // than read from the GEngine global because Init runs during engine
+    // construction, before GEngine is assigned.
+    void Init(SDL_Window* window, Poseidon::Engine* engine);
     void ProcessEvent(const SDL_Event& event);
 
     // Fire an in-process content re-mount through the exact deferred path the MODS-tab

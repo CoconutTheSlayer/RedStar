@@ -26,6 +26,8 @@
 // for `glDrawElements`).  Keeps the frame-layer header out of the Core
 // base; the GL33 override pulls it in `.cpp`.
 
+struct SDL_Window; // for the dev-overlay backend hooks (ImGui platform init)
+
 namespace Poseidon
 {
 
@@ -382,6 +384,18 @@ class Engine : public IGraphicsEngine
     // and rebuild the GL infrastructure, keeping the window + device alive. Used
     // by the in-process mod re-mount; default no-op for headless backends.
     virtual void ResetForRemount() {}
+
+    // Dev-overlay (ImGui) backend hooks.  DebugOverlay owns the ImGui context +
+    // UI and the SDL3 *event* path, but the renderer/platform backend is
+    // per-engine so no GL symbols leak into shared code: GL33 wires
+    // imgui_impl_opengl3 + the FBO-0 bind, Metal wires imgui_impl_metal.  Default
+    // no-ops (Dummy / headless): the overlay stays inert but never touches GL.
+    //   OverlayBackendInit returns false if the backend has no ImGui support.
+    virtual bool OverlayBackendInit(SDL_Window* window) { return false; }
+    virtual void OverlayBackendShutdown() {}
+    virtual void OverlayBackendNewFrame() {}
+    virtual void OverlayBackendRender() {} // ImGui_Impl*_RenderDrawData(ImGui::GetDrawData())
+
     void FogColorChanged(ColorVal fogColor) override = 0;
 
     bool SwitchRes(int w, int h, int bpp) override = 0; // switch to resolution nearest to w,h

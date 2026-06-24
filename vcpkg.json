@@ -21,6 +21,11 @@
       "features": ["sdl3-binding", "sdl3-renderer-binding", "opengl3-binding", "freetype"]
     },
     {
+      "name": "imgui",
+      "features": ["metal-binding"],
+      "platform": "osx"
+    },
+    {
       "name": "spdlog",
       "features": ["wchar"],
       "platform": "windows"
